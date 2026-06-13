@@ -1,6 +1,7 @@
-"""Shared helpers for the i4i capacity-grab scripts (us-east-1).
+"""Shared helpers for the i4i capacity-grab scripts.
 
 Both grab_ondemand.py and grab_odcr.py import from here.
+Region is configurable via --region (default: us-east-1).
 """
 import time
 import random
@@ -9,7 +10,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
-REGION = "us-east-1"
+DEFAULT_REGION = "us-east-1"
 
 # vCPU per i4i size — used to count progress toward the core target.
 VCPU = {
@@ -62,8 +63,8 @@ def setup_logging():
     return logging.getLogger("i4i-grab")
 
 
-def ec2_client():
-    return boto3.client("ec2", region_name=REGION)
+def ec2_client(region=DEFAULT_REGION):
+    return boto3.client("ec2", region_name=region)
 
 
 def list_azs(client):

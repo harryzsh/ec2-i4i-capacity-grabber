@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Grab i4i capacity by launching plain On-Demand instances (us-east-1).
+"""Grab i4i capacity by launching plain On-Demand instances.
+
+Region is configurable via --region (default: us-east-1).
 
 Strategy: sweep AZ x instance-type (small first), RunInstances count=1 each,
 keep what launches, count vCPUs toward a target, stop at the cap. Instances
@@ -19,7 +21,7 @@ import sys
 from botocore.exceptions import ClientError
 
 from common import (
-    REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs, subnets_by_az,
+    DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs, subnets_by_az,
     offered_types_by_az, backoff_sleep, classify, setup_logging,
 )
 
@@ -75,16 +77,16 @@ def terminate_tagged(client, dry_run):
 
 
 def run(args):
-    client = ec2_client()
+    client = ec2_client(args.region)
     dry = not args.live
 
     if args.terminate_tagged:
         terminate_tagged(client, dry)
         return
 
-    ami = resolve_ami(REGION)
+    ami = resolve_ami(args.region)
     log.info("region=%s ami=%s dry_run=%s target_cores=%d",
-             REGION, ami, dry, args.target_cores)
+             args.region, ami, dry, args.target_cores)
 
     priority = args.types or DEFAULT_PRIORITY
     azs = list_azs(client)
@@ -154,6 +156,8 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description="Grab i4i via plain On-Demand")
+    p.add_argument("--region", default=DEFAULT_REGION,
+                   help="AWS region to target (default %s)" % DEFAULT_REGION)
     p.add_argument("--target-cores", type=int, default=8,
                    help="stop once this many vCPU are secured (default 8)")
     p.add_argument("--types", nargs="*", help="override instance-type priority list")

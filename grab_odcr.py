@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Grab i4i capacity via On-Demand Capacity Reservations (us-east-1).
+"""Grab i4i capacity via On-Demand Capacity Reservations.
+
+Region is configurable via --region (default: us-east-1).
 
 Strategy: sweep AZ x instance-type (small first), CreateCapacityReservation
 count=1 each (all-or-nothing per call, so count=1 scavenges fragments), tag
@@ -25,7 +27,7 @@ import sys
 from botocore.exceptions import ClientError
 
 from common import (
-    REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs,
+    DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs,
     offered_types_by_az, backoff_sleep, classify, setup_logging,
 )
 
@@ -97,7 +99,7 @@ def cancel_all(client, dry_run):
 
 
 def run(args):
-    client = ec2_client()
+    client = ec2_client(args.region)
     dry = not args.live
 
     if args.list:
@@ -114,7 +116,7 @@ def run(args):
         return
 
     log.info("region=%s dry_run=%s target_cores=%d end_hours=%s",
-             REGION, dry, args.target_cores, args.end_hours)
+             args.region, dry, args.target_cores, args.end_hours)
 
     priority = args.types or DEFAULT_PRIORITY
     azs = list_azs(client)
@@ -171,6 +173,8 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description="Grab i4i via On-Demand Capacity Reservations")
+    p.add_argument("--region", default=DEFAULT_REGION,
+                   help="AWS region to target (default %s)" % DEFAULT_REGION)
     p.add_argument("--target-cores", type=int, default=8,
                    help="stop once this many vCPU are reserved (default 8)")
     p.add_argument("--types", nargs="*", help="override instance-type priority list")

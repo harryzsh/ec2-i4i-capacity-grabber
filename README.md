@@ -1,7 +1,10 @@
 # ec2-i4i-capacity-grabber
 
-抢占 **us-east-1** 区域 i4i（存储优化型，Intel Ice Lake + Nitro SSD）EC2 容量的双策略脚本，
+抢占 i4i（存储优化型，Intel Ice Lake + Nitro SSD）EC2 容量的双策略脚本，
 用于 Prime Day 等峰值场景下的产能储备。提供两条互补的抢占路线，可按业务形态二选一或组合使用。
+
+> **区域可配置**：默认 `us-east-1`，所有命令都支持 `--region <region>` 切换到任意区域
+> （如 `--region us-west-2`、`--region ap-southeast-1`）。AZ、子网、机型 offering 都会按所选区域自动发现。
 
 | 脚本 | 策略 | 适用场景 |
 |------|------|----------|
@@ -71,6 +74,7 @@ python3 grab_ondemand.py --terminate-tagged --live
 ```
 
 参数：
+- `--region R`：目标区域（默认 us-east-1），如 `--region us-west-2`
 - `--target-cores N`：抢到 N 个 vCPU 就停（默认 8）
 - `--types ...`：覆盖默认机型优先级，如 `--types i4i.large i4i.xlarge i4g.large`（可混入 i4g 兜底）
 - `--live`：真正执行（不加则 dry-run）
@@ -96,6 +100,7 @@ python3 grab_odcr.py --cancel-all --live
 ```
 
 参数：
+- `--region R`：目标区域（默认 us-east-1），如 `--region us-west-2`
 - `--target-cores N`：预留到 N 个 vCPU 就停（默认 8）
 - `--types ...`：覆盖默认机型优先级
 - `--end-hours N`：N 小时后预留自动过期（计费保险，默认不过期直到手动取消）
@@ -140,7 +145,6 @@ python3 grab_odcr.py --cancel-all --live
 
 ## 成本参考
 
-- `i4i.large` = **$0.172/小时**（us-east-1，On-Demand，按秒计费，最低 60 秒），2 vCPU。
+- `i4i.large` = **$0.172/小时**（us-east-1 参考价，On-Demand，按秒计费，最低 60 秒），2 vCPU。价格随区域不同，以 AWS Pricing API 实时为准。
 - 实弹验证已通过：分别启了 1 个实例 + 建了 1 个预留，各持有约 30 秒后清理，总花费约 $0.003。
-
-> 价格数据采集于 2026-06-12，以 AWS Pricing API 实时为准。
+- `--region` 已在 us-east-1 / us-west-2 验证可正常发现各自的 AZ 与机型 offering。
