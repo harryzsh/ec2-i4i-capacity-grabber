@@ -29,7 +29,7 @@ from botocore.exceptions import ClientError
 from common import (
     DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs, subnets_by_az,
     offered_types_by_az, backoff_sleep, classify, setup_logging,
-    record_grab,
+    record_grab, resolve_types, resolve_azs,
 )
 
 TAG_KEY = "purpose"
@@ -144,15 +144,37 @@ def run(args):
     log.info("region=%s ami=%s dry_run=%s target_cores=%d watch=%s",
              args.region, ami, not args.live, args.target_cores, args.watch)
 
-    priority = args.types or DEFAULT_PRIORITY
-    azs = list_azs(client)
+    # Resolve & normalize the type priority (auto-sorted large-first) and
+    # write it back so sweep_once() uses the exact same ordered list.
+    types, dropped = resolve_types(args.types)
+    if dropped:
+        log.warning("ignoring unknown instance types (not in VCPU table): %s", dropped)
+    args.types = types
+    log.info("instance-type priority (large-first): %s", types)
+
+    all_azs = list_azs(client)
     subs = subnets_by_az(client)
-    offered = offered_types_by_az(client, priority)
+    offered = offered_types_by_az(client, types)
+
+    # Lock the sweep to --azs if given, else use every AZ in the region.
+    azs, missing = resolve_azs(all_azs, args.azs)
+    if missing:
+        log.warning("requested AZs not present in %s (ignored): %s", args.region, missing)
+    if not azs:
+        log.error("no usable AZs after applying --azs %s — nothing to do", args.azs)
+        return
+    log.info("target AZs: %s", azs)
 
     usable_azs = [az for az in azs if az in subs]
-    skipped = [az for az in azs if az not in subs]
-    if skipped:
-        log.warning("AZs WITHOUT a subnet (cannot RunInstances there): %s", skipped)
+    no_subnet = [az for az in azs if az not in subs]
+    if no_subnet:
+        # For On-Demand we MUST have a subnet to RunInstances. If a requested
+        # AZ has none, fail loud rather than silently grabbing nothing.
+        log.error("requested AZ(s) have NO subnet, cannot launch On-Demand there: %s", no_subnet)
+        log.error("create a subnet in those AZs first, or use grab_odcr.py (ODCR needs no subnet)")
+    if not usable_azs:
+        log.error("no usable AZs with a subnet — aborting")
+        return
     log.info("usable AZs (have subnet): %s", usable_azs)
 
     state = {"grabbed": 0, "launched": []}
@@ -187,7 +209,13 @@ def main():
                    help="AWS region to target (default %s)" % DEFAULT_REGION)
     p.add_argument("--target-cores", type=int, default=8,
                    help="stop once this many vCPU are secured (default 8)")
-    p.add_argument("--types", nargs="*", help="override instance-type priority list")
+    p.add_argument("--types", nargs="*",
+                   help="instance-type list; default is ONLY i4i.16xlarge. "
+                        "Pass extras to allow fallback, e.g. "
+                        "--types i4i.16xlarge i4i.8xlarge (auto-sorted large-first)")
+    p.add_argument("--azs", nargs="*",
+                   help="lock to these AZ names, e.g. --azs us-east-1c us-east-1d "
+                        "(default: every AZ in the region)")
     p.add_argument("--watch", action="store_true",
                    help="loop forever, re-sweeping until target reached (24x7 hunt)")
     p.add_argument("--interval", type=int, default=60,

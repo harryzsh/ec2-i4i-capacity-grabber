@@ -41,16 +41,10 @@ VCPU = {
     "i4g.16xlarge": 64,
 }
 
-# Priority order: LARGE sizes first (grab big chunks to hit the core target
-# with fewer instances/reservations and fewer API calls; fall back to smaller
-# sizes when big blocks aren't available).
-DEFAULT_PRIORITY = [
-    "i4i.8xlarge",
-    "i4i.4xlarge",
-    "i4i.2xlarge",
-    "i4i.xlarge",
-    "i4i.large",
-]
+# DEFAULT: only i4i.16xlarge. The requirement is "must be 16xl by default".
+# To allow fallback to other sizes, pass --types explicitly; whatever you pass
+# is auto-sorted LARGE-first (see resolve_types) so big blocks go first.
+DEFAULT_PRIORITY = ["i4i.16xlarge"]
 
 # Errors that just mean "no capacity here, move on" — NOT a script failure.
 CAPACITY_ERRORS = {
@@ -118,6 +112,41 @@ def record_grab(via, itype, az, vcpu, total, target, region, dry_run):
 
 def ec2_client(region=DEFAULT_REGION):
     return boto3.client("ec2", region_name=region)
+
+
+def resolve_types(types):
+    """Normalize the instance-type priority list.
+
+    - None / empty  -> DEFAULT_PRIORITY (just i4i.16xlarge).
+    - Otherwise     -> the given list, auto-sorted LARGE-first by vCPU so the
+                       caller never has to worry about ordering. Unknown types
+                       (not in VCPU) are dropped with the list of drops returned
+                       so the caller can warn.
+    Returns (ordered_types, dropped_unknown).
+    """
+    if not types:
+        return list(DEFAULT_PRIORITY), []
+    known = [t for t in types if t in VCPU]
+    dropped = [t for t in types if t not in VCPU]
+    ordered = sorted(known, key=lambda t: VCPU[t], reverse=True)
+    return ordered, dropped
+
+
+def resolve_azs(all_azs, requested):
+    """Lock the sweep to a caller-supplied AZ list.
+
+    all_azs:   AZ names actually available in the region (from list_azs).
+    requested: AZ names passed via --azs (e.g. ['us-east-1c','us-east-1d']);
+               None/empty means "use every available AZ".
+    Returns (selected_azs, missing) where missing are requested AZs that don't
+    exist in the region (so the caller can warn instead of silently dropping).
+    """
+    if not requested:
+        return list(all_azs), []
+    avail = set(all_azs)
+    selected = [az for az in requested if az in avail]
+    missing = [az for az in requested if az not in avail]
+    return selected, missing
 
 
 def list_azs(client):

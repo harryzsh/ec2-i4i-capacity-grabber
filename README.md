@@ -21,7 +21,7 @@
 两个脚本共享 `common.py`，核心思路一致：
 
 1. **自动发现** 区域内所有可用 AZ、各 AZ 的可用子网、以及每个实例类型在哪些 AZ 真正被提供（跳过不可能的调用）。
-2. **大机型优先扫描**：默认按 `i4i.8xlarge → 4xlarge → 2xlarge → xlarge → large` 顺序，逐个 AZ 尝试。大机型一台就是一大块核（8xlarge=32 核），凑够目标核数所需的实例/预留数量和 API 调用更少；抢不到大块时自动降级到小机型兜底。
+2. **默认只抢 `i4i.16xlarge`（64 核）**：一台就是一大块核，凑够目标核数所需的实例/预留数量和 API 调用最少。需要降级兜底时，用 `--types` 显式列出其他机型，脚本会**自动按 vCPU 从大到小排序**后逐个尝试（你不用关心写的顺序）。
 3. **逐个抢**：每次只 `count=1`，抢到一个就累加 vCPU，直到达到 `--target-cores` 目标。
 4. **智能处理**：
    - 没产能（`InsufficientInstanceCapacity` 等）→ 记一笔，换下一个 AZ/机型，不算失败。
@@ -94,7 +94,8 @@ python3 grab_ondemand.py --terminate-tagged --live
 |------|------|--------|------|
 | `--region R` | 在哪个 AWS 区域抢 | `us-east-1` | `--region us-west-2` |
 | `--target-cores N` | 抢够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
-| `--types ...` | 自定义机型优先级，按你写的顺序抢（可混 i4g 兜底） | 内置大机型优先 | `--types i4i.4xlarge i4i.2xlarge i4g.4xlarge` |
+| `--types ...` | 机型列表，脚本**自动按 vCPU 从大到小排序**（顺序随便写）。不传 = 只抢 `i4i.16xlarge`。传多个 = 允许降级兜底（可混 i4g） | 只 `i4i.16xlarge` | `--types i4i.16xlarge i4i.8xlarge i4g.16xlarge` |
+| `--azs ...` | 锁定只在这些 AZ 抢（写 AZ 名字）。不传 = 区域内所有 AZ | 所有 AZ | `--azs us-east-1c us-east-1d` |
 | `--live` | 真正启实例。**不加 = 只演练不启** | 关闭（演练） | `--live` |
 | `--watch` | 24×7 死等模式：循环重扫，直到抢够 `--target-cores` 才停（产能是间歇放出来的，盯着才抢得到） | 关闭（扫一遍就退出） | `--watch` |
 | `--interval N` | `--watch` 模式下每轮之间隔几秒 | `60` | `--interval 30` |
@@ -134,7 +135,8 @@ python3 grab_odcr.py --cancel-all --live
 |------|------|--------|------|
 | `--region R` | 在哪个 AWS 区域抢 | `us-east-1` | `--region us-west-2` |
 | `--target-cores N` | 预留够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
-| `--types ...` | 自定义机型优先级，按你写的顺序抢 | 内置大机型优先 | `--types i4i.4xlarge i4i.2xlarge` |
+| `--types ...` | 机型列表，脚本**自动按 vCPU 从大到小排序**（顺序随便写）。不传 = 只预留 `i4i.16xlarge` | 只 `i4i.16xlarge` | `--types i4i.16xlarge i4i.8xlarge` |
+| `--azs ...` | 锁定只在这些 AZ 预留（写 AZ 名字）。不传 = 区域内所有 AZ | 所有 AZ | `--azs us-east-1c us-east-1d` |
 | `--end-hours N` | N 小时后预留**自动过期释放**（计费保险，防止忘关） | 不过期，直到手动取消 | `--end-hours 6` |
 | `--live` | 真正建预留。**不加 = 只演练不建**。⚠️ 加了立刻计费 | 关闭（演练） | `--live` |
 | `--watch` | 24×7 死等模式：循环重扫，直到预留够 `--target-cores` 才停 | 关闭（扫一遍就退出） | `--watch` |
@@ -148,10 +150,10 @@ python3 grab_odcr.py --cancel-all --live
 
 ---
 
-## 两个脚本共有的机型优先级
+## 两个脚本共有的机型策略
 
-默认都按**大机型优先**抢：`i4i.8xlarge → 4xlarge → 2xlarge → xlarge → large`。
-大机型一台就是一大块核（8xlarge = 32 核），凑够目标核数所需的实例数更少；抢不到大块时自动往下降级。
+**默认只抢 `i4i.16xlarge`（64 核）**——一台一大块核，凑够目标所需的实例/预留数最少。
+需要降级兜底时，用 `--types` 列出多个机型即可，脚本会**自动按 vCPU 从大到小排序**后逐个尝试（你写的顺序无所谓，未知机型会被自动忽略并告警）。
 内置的 vCPU 对照（用 `--types` 自定义时参考）：
 
 | 机型 | vCPU | 内存 | 本地 NVMe SSD |
@@ -161,16 +163,25 @@ python3 grab_odcr.py --cancel-all --live
 | `i4i.2xlarge` | 8 | 64 GiB | 1 × 1,875 GB |
 | `i4i.4xlarge` | 16 | 128 GiB | 1 × 3,750 GB |
 | `i4i.8xlarge` | 32 | 256 GiB | 2 × 3,750 GB |
+| `i4i.16xlarge` | 64 | 512 GiB | 4 × 3,750 GB |
+| `i4i.32xlarge` | 128 | 1,024 GiB | 8 × 3,750 GB |
 
 ---
 
 ## Prime Day 实战剧本
 
 1. 让 TAM 把 i4i On-Demand vCPU 配额提到 ≥ 10000。
-2. 确认目标账号在各 AZ 有子网（On-Demand 路线需要）。
-3. 开抢：
+2. 确认目标账号在各 AZ 有子网（On-Demand 路线需要；ODCR 不需要子网）。
+3. 开抢（默认只抢 `i4i.16xlarge`。如要锁定特定 AZ，加 `--azs`；如要允许降级兜底，加 `--types`）：
    ```bash
+   # 全 AZ、只抢 16xlarge
    python3 grab_odcr.py --target-cores 10000 --live
+
+   # 只在指定 AZ 抢
+   python3 grab_odcr.py --target-cores 10000 --live --azs us-east-1c us-east-1d
+
+   # 允许降级兜底（16xl 抢不到就往下）
+   python3 grab_odcr.py --target-cores 10000 --live --types i4i.16xlarge i4i.8xlarge i4i.4xlarge
    ```
 4. 持续盯：
    ```bash

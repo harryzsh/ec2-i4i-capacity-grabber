@@ -36,7 +36,7 @@ from botocore.exceptions import ClientError
 from common import (
     DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, ec2_client, list_azs,
     offered_types_by_az, backoff_sleep, classify, setup_logging,
-    record_grab,
+    record_grab, resolve_types, resolve_azs,
 )
 
 TAG_KEY = "purpose"
@@ -169,10 +169,26 @@ def run(args):
     log.info("region=%s dry_run=%s target_cores=%d end_hours=%s watch=%s",
              args.region, not args.live, args.target_cores, args.end_hours, args.watch)
 
-    priority = args.types or DEFAULT_PRIORITY
-    azs = list_azs(client)
-    offered = offered_types_by_az(client, priority)
-    log.info("AZs: %s", azs)
+    # Resolve & normalize the type priority (auto-sorted large-first) and
+    # write it back so sweep_once() uses the exact same ordered list.
+    types, dropped = resolve_types(args.types)
+    if dropped:
+        log.warning("ignoring unknown instance types (not in VCPU table): %s", dropped)
+    args.types = types
+    log.info("instance-type priority (large-first): %s", types)
+
+    all_azs = list_azs(client)
+    offered = offered_types_by_az(client, types)
+
+    # Lock the sweep to --azs if given, else use every AZ in the region.
+    # ODCR needs NO subnet, so any available AZ works.
+    azs, missing = resolve_azs(all_azs, args.azs)
+    if missing:
+        log.warning("requested AZs not present in %s (ignored): %s", args.region, missing)
+    if not azs:
+        log.error("no usable AZs after applying --azs %s — nothing to do", args.azs)
+        return
+    log.info("target AZs: %s", azs)
 
     state = {"reserved": 0, "made": []}
 
@@ -209,7 +225,13 @@ def main():
                    help="AWS region to target (default %s)" % DEFAULT_REGION)
     p.add_argument("--target-cores", type=int, default=8,
                    help="stop once this many vCPU are reserved (default 8)")
-    p.add_argument("--types", nargs="*", help="override instance-type priority list")
+    p.add_argument("--types", nargs="*",
+                   help="instance-type list; default is ONLY i4i.16xlarge. "
+                        "Pass extras to allow fallback, e.g. "
+                        "--types i4i.16xlarge i4i.8xlarge (auto-sorted large-first)")
+    p.add_argument("--azs", nargs="*",
+                   help="lock to these AZ names, e.g. --azs us-east-1c us-east-1d "
+                        "(default: every AZ in the region)")
     p.add_argument("--end-hours", type=float, default=None,
                    help="auto-expire reservations after N hours (billing guard)")
     p.add_argument("--watch", action="store_true",
