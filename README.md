@@ -135,6 +135,7 @@ python3 grab_odcr.py --cancel-all --live
 |------|------|--------|------|
 | `--region R` | 在哪个 AWS 区域抢 | `us-east-1` | `--region us-west-2` |
 | `--target-cores N` | 预留够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
+| `--per-az-cores N` | **均衡模式**：每个 AZ 各封顶 N 个 vCPU，某个 AZ 凑满就跳过、继续抢其余 AZ，让预留在各 AZ 间均匀分布（对齐 ASG 的 50/50 调度）。单独设此项、`--target-cores` 留默认时，总目标自动 = `N × AZ数` | 关闭（不均衡） | `--per-az-cores 5000` |
 | `--types ...` | 机型列表，脚本**自动按 vCPU 从大到小排序**（顺序随便写）。不传 = 只预留 `i4i.16xlarge` | 只 `i4i.16xlarge` | `--types i4i.16xlarge i4i.8xlarge` |
 | `--azs ...` | 锁定只在这些 AZ 预留（写 AZ 名字）。不传 = 区域内所有 AZ | 所有 AZ | `--azs us-east-1c us-east-1d` |
 | `--end-hours N` | N 小时后预留**自动过期释放**（计费保险，防止忘关） | 不过期，直到手动取消 | `--end-hours 6` |
@@ -170,22 +171,43 @@ python3 grab_odcr.py --cancel-all --live
 
 ## Prime Day 实战剧本
 
-1. 让 TAM 把 i4i On-Demand vCPU 配额提到 ≥ 10000。
-2. 确认目标账号在各 AZ 有子网（On-Demand 路线需要；ODCR 不需要子网）。
-3. 开抢（默认只抢 `i4i.16xlarge`。如要锁定特定 AZ，加 `--azs`；如要允许降级兜底，加 `--types`）：
-   ```bash
-   # 全 AZ、只抢 16xlarge
-   python3 grab_odcr.py --target-cores 10000 --live
+### ⭐ 本次 Prime Day 标准命令（10000 vCPU 总数，两 AZ 均衡）
 
-   # 只在指定 AZ 抢
-   python3 grab_odcr.py --target-cores 10000 --live --azs us-east-1c us-east-1d
+> 目标是 **10000 vCPU 总数**（不是 10000 台），均匀铺在 `us-east-1b` / `us-east-1d` 两个 AZ。
+> 每 AZ 各封顶 `10000 ÷ 2 = 5000` vCPU；i4i.16xlarge = 64 vCPU/台，即每 AZ 约 78 台、合计约 156 台。
+> 用 `--per-az-cores` 设单 AZ 上限，脚本会**自动把总目标算成 `5000 × 2 = 10000`**，你只需填一个数。
 
-   # 允许降级兜底（16xl 抢不到就往下）
-   python3 grab_odcr.py --target-cores 10000 --live --types i4i.16xlarge i4i.8xlarge i4i.4xlarge
-   ```
-4. 持续盯：
+```bash
+# 第 0 步：先演练（不加 --live），确认 AZ、机型、每 AZ 上限、总目标都对
+python3 grab_odcr.py \
+  --azs us-east-1b us-east-1d \
+  --per-az-cores 5000
+
+# 第 1 步：实弹 24×7 死等，两 AZ 均衡抢满 10000 vCPU（⚠️ 一加 --live 立刻计费）
+python3 grab_odcr.py \
+  --azs us-east-1b us-east-1d \
+  --per-az-cores 5000 \
+  --live --watch --interval 30
+```
+
+- **`--per-az-cores 5000`**：每个 AZ 各到 5000 vCPU 就停抢、跳过去抢另一个 AZ，预留天然均衡（对齐 ASG 的 50/50 调度），不会单边堆出空转浪费。
+- **`--watch --interval 30`**：产能是间歇放出来的，每 30 秒重扫一次、死等攒满，已抢到的累加、每轮只补差额。
+- **不加 `--end-hours`**：Prime Day 要长期持有产能，不能让预留中途自动过期；用完手动 `--cancel-all` 释放。
+- 挂在 `tmux` / `nohup` 里长期跑，`Ctrl-C` 随时安全退出，已抢资源不受影响。
+
+> 想加计费保险（比如怕忘关）可附 `--end-hours 12`，但要确保大于你实际持有时长，否则预留会提前释放。
+> 想允许降级兜底（16xl 抢不到就往下），加 `--types i4i.16xlarge i4i.8xlarge i4i.4xlarge`（脚本自动按 vCPU 从大到小排序）。
+
+### 完整步骤
+
+1. 让 TAM 把 i4i On-Demand vCPU 配额提到 ≥ 10000，否则会先撞配额（`VcpuLimitExceeded`）而不是产能上限。
+2. 确认目标账号在 `us-east-1b` / `us-east-1d` 有子网（ODCR 建预留不需要子网，但真正往预留里启实例时需要）。
+3. 跑上面的 ⭐ 标准命令（先演练后实弹）。
+4. 持续盯进度：
    ```bash
-   python3 grab_odcr.py --list
+   python3 grab_odcr.py --list                 # 当前持有哪些预留
+   tail -f logs/grab_odcr.log                   # 实时流水，看各 AZ 分布
+   wc -l logs/grabs.jsonl                        # 已抢到多少笔
    ```
 5. 等 James 那边正规 i4i 供给到位后，释放预留、停止计费：
    ```bash

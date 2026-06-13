@@ -109,11 +109,25 @@ def cancel_all(client, dry_run):
 def _on_grab(args, crid, itype, az, state):
     """Bookkeeping for one secured reservation: count, log, ledger, push."""
     state["reserved"] += VCPU[itype]
+    state["per_az"][az] = state["per_az"].get(az, 0) + VCPU[itype]
     state["made"].append((crid, itype, az))
-    log.info("RESERVED %s %s @ %s (+%d vCPU, total %d/%d)",
-             crid, itype, az, VCPU[itype], state["reserved"], args.target_cores)
+    if args.per_az_cores:
+        log.info("RESERVED %s %s @ %s (+%d vCPU | %s: %d/%d | total %d/%d)",
+                 crid, itype, az, VCPU[itype], az,
+                 state["per_az"][az], args.per_az_cores,
+                 state["reserved"], args.target_cores)
+    else:
+        log.info("RESERVED %s %s @ %s (+%d vCPU, total %d/%d)",
+                 crid, itype, az, VCPU[itype], state["reserved"], args.target_cores)
     record_grab("odcr", itype, az, VCPU[itype], state["reserved"],
                 args.target_cores, args.region, not args.live)
+
+
+def _az_full(args, state, az):
+    """True if this AZ has hit its per-AZ cap (balanced mode only)."""
+    if args.per_az_cores is None:
+        return False
+    return state["per_az"].get(az, 0) >= args.per_az_cores
 
 
 def sweep_once(client, args, azs, offered, state):
@@ -126,6 +140,8 @@ def sweep_once(client, args, azs, offered, state):
         for az in azs:
             if state["reserved"] >= args.target_cores:
                 return
+            if _az_full(args, state, az):
+                continue  # balanced mode: this AZ hit its per-AZ cap
             if (itype, az) not in offered:
                 continue
             try:
@@ -190,7 +206,21 @@ def run(args):
         return
     log.info("target AZs: %s", azs)
 
-    state = {"reserved": 0, "made": []}
+    # BALANCED mode: if --per-az-cores is set and --target-cores was left at the
+    # default, auto-compute the total as per_az_cores * number-of-AZs so the
+    # caller only has to supply ONE number.
+    if args.per_az_cores is not None:
+        auto_total = args.per_az_cores * len(azs)
+        if args.target_cores == 8:  # untouched default
+            args.target_cores = auto_total
+            log.info("balanced mode: per-az cap %d vCPU x %d AZ -> target %d vCPU",
+                     args.per_az_cores, len(azs), args.target_cores)
+        elif args.target_cores != auto_total:
+            log.warning("balanced mode: --target-cores %d != per-az %d x %d AZ (%d); "
+                        "using --target-cores as the hard overall stop",
+                        args.target_cores, args.per_az_cores, len(azs), auto_total)
+
+    state = {"reserved": 0, "made": [], "per_az": {}}
 
     if args.watch:
         log.info("WATCH mode: re-sweeping every %ds until %d vCPU reserved "
@@ -210,6 +240,12 @@ def run(args):
 
     log.info("=== DONE: reserved %d/%d vCPU across %d reservation(s) ===",
              state["reserved"], args.target_cores, len(state["made"]))
+    if args.per_az_cores is not None:
+        for az in azs:
+            got = state["per_az"].get(az, 0)
+            flag = "FULL" if got >= args.per_az_cores else "short"
+            log.info("  per-AZ %s: %d/%d vCPU (%d instances) [%s]",
+                     az, got, args.per_az_cores, got // 64, flag)
     for crid, t, a in state["made"]:
         log.info("  %s %s @ %s", crid, t, a)
     if not args.live:
@@ -224,7 +260,15 @@ def main():
     p.add_argument("--region", default=DEFAULT_REGION,
                    help="AWS region to target (default %s)" % DEFAULT_REGION)
     p.add_argument("--target-cores", type=int, default=8,
-                   help="stop once this many vCPU are reserved (default 8)")
+                   help="stop once this many vCPU are reserved (default 8). "
+                        "If --per-az-cores is set and this is left at default, "
+                        "the total is auto-computed as per-az-cores x number-of-AZs.")
+    p.add_argument("--per-az-cores", type=int, default=None,
+                   help="BALANCED mode: cap EACH AZ at this many vCPU. The sweep "
+                        "skips any AZ that hits its cap and keeps hunting the rest, "
+                        "so reservations stay even across --azs (matches ASG's 50/50 "
+                        "balancing). e.g. --azs us-east-1b us-east-1d --per-az-cores 3840 "
+                        "caps each AZ at 3840 vCPU (=60x i4i.16xlarge), 7680 total.")
     p.add_argument("--types", nargs="*",
                    help="instance-type list; default is ONLY i4i.16xlarge. "
                         "Pass extras to allow fallback, e.g. "
