@@ -58,58 +58,105 @@
 
 ---
 
-## 用法
+## 最重要的一个开关：`--live`
 
-### On-Demand 路线（`grab_ondemand.py`）
+两个脚本**默认都是演练模式（dry-run）**，只校验权限和参数、打印计划，**不会真的动任何资源、不花一分钱**。
+只有当你加上 `--live`，才会真正去抢。先不加 `--live` 跑一遍看计划，确认无误再加 `--live` 实弹，这是最安全的用法。
 
 ```bash
-# 1) 先 dry-run 看计划（不启任何实例）
+python3 grab_ondemand.py --target-cores 8           # 演练：只看计划，不启实例
+python3 grab_ondemand.py --target-cores 8 --live    # 实弹：真的启实例
+```
+
+---
+
+## 脚本一：`grab_ondemand.py`（普通 On-Demand 抢占）
+
+**做什么**：直接启动 i4i 实例。实例只要保持 running 就占住产能；一旦 stop/terminate，产能立刻还回公共池。
+**适合**：负载稳定、实例长期持续运行的场景。
+
+### 常用命令
+
+```bash
+# 1) 演练，看会抢哪些机型、哪些 AZ（不启任何实例）
 python3 grab_ondemand.py --target-cores 8
 
-# 2) 真正抢（启实例并保持 running）
-python3 grab_ondemand.py --target-cores 8 --live
+# 2) 实弹，真正启实例并保持 running
+python3 grab_ondemand.py --target-cores 10000 --live
 
-# 3) 用完拆除：终止所有打了标签的实例
+# 3) 用完清理，终止本脚本启的所有实例
 python3 grab_ondemand.py --terminate-tagged --live
 ```
 
-参数：
-- `--region R`：目标区域（默认 us-east-1），如 `--region us-west-2`
-- `--target-cores N`：抢到 N 个 vCPU 就停（默认 8）
-- `--types ...`：覆盖默认机型优先级，如 `--types i4i.large i4i.xlarge i4g.large`（可混入 i4g 兜底）
-- `--live`：真正执行（不加则 dry-run）
-- `--terminate-tagged`：终止所有 `purpose=primeday-i4i-grab` 实例
+### 全部参数
 
-### ODCR 路线（`grab_odcr.py`）
+| 参数 | 作用 | 默认值 | 示例 |
+|------|------|--------|------|
+| `--region R` | 在哪个 AWS 区域抢 | `us-east-1` | `--region us-west-2` |
+| `--target-cores N` | 抢够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
+| `--types ...` | 自定义机型优先级，按你写的顺序抢（可混 i4g 兜底） | 内置大机型优先 | `--types i4i.4xlarge i4i.2xlarge i4g.4xlarge` |
+| `--live` | 真正启实例。**不加 = 只演练不启** | 关闭（演练） | `--live` |
+| `--terminate-tagged` | 一键终止本脚本启的所有实例（清理用） | 关闭 | `--terminate-tagged --live` |
+| `-h` / `--help` | 显示帮助 | — | `--help` |
+
+---
+
+## 脚本二：`grab_odcr.py`（容量预留 ODCR 抢占）
+
+**做什么**：创建容量预留，把产能锁在你名下。即使没启实例、或实例停了，产能也不会还回去。
+**适合**：业务有 stop/restart 周期、或迁移窗口需要「停了也不丢产能」的场景。
+**⚠️ 注意**：active 预留**立刻按 On-Demand 价持续计费**（无论里面有没有跑实例），用完务必 `--cancel-all` 释放。
+
+### 常用命令
 
 ```bash
-# 1) dry-run 看计划（不建预留、不计费）
+# 1) 演练，看会预留哪些机型（不建预留、不计费）
 python3 grab_odcr.py --target-cores 8
 
-# 2) 真正预留（注意：active 预留立刻开始计费！）
-python3 grab_odcr.py --target-cores 8 --live
+# 2) 实弹预留（⚠️ 一加 --live 就立刻开始计费）
+python3 grab_odcr.py --target-cores 10000 --live
 
-# 可选：加计费保险，N 小时后自动过期
-python3 grab_odcr.py --target-cores 8 --live --end-hours 6
+# 3) 加计费保险：6 小时后预留自动过期释放，防止忘记取消
+python3 grab_odcr.py --target-cores 10000 --live --end-hours 6
 
-# 3) 查看当前所有 active/pending 预留
+# 4) 随时查看当前持有哪些预留
 python3 grab_odcr.py --list
 
-# 4) 释放全部预留（停止计费）—— 等正规 i4i 供给到位后执行
+# 5) 释放全部预留、停止计费（正规 i4i 供给到位后执行）
 python3 grab_odcr.py --cancel-all --live
 ```
 
-参数：
-- `--region R`：目标区域（默认 us-east-1），如 `--region us-west-2`
-- `--target-cores N`：预留到 N 个 vCPU 就停（默认 8）
-- `--types ...`：覆盖默认机型优先级
-- `--end-hours N`：N 小时后预留自动过期（计费保险，默认不过期直到手动取消）
-- `--live`：真正执行（不加则 dry-run）
-- `--cancel-all`：取消所有打标签的预留
-- `--list`：列出当前预留后退出
+### 全部参数
 
-> 即时预留（脚本默认用的）**无最低承诺**，可随时取消。
-> 若要 Foob 里预订未来某天（如 0703）的产能，需要带 `commitmentDuration`，那要和供给侧另行协商。
+| 参数 | 作用 | 默认值 | 示例 |
+|------|------|--------|------|
+| `--region R` | 在哪个 AWS 区域抢 | `us-east-1` | `--region us-west-2` |
+| `--target-cores N` | 预留够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
+| `--types ...` | 自定义机型优先级，按你写的顺序抢 | 内置大机型优先 | `--types i4i.4xlarge i4i.2xlarge` |
+| `--end-hours N` | N 小时后预留**自动过期释放**（计费保险，防止忘关） | 不过期，直到手动取消 | `--end-hours 6` |
+| `--live` | 真正建预留。**不加 = 只演练不建**。⚠️ 加了立刻计费 | 关闭（演练） | `--live` |
+| `--cancel-all` | 取消所有预留、**停止计费**（清理用） | 关闭 | `--cancel-all --live` |
+| `--list` | 只查看当前持有的预留，不增不删 | 关闭 | `--list` |
+| `-h` / `--help` | 显示帮助 | — | `--help` |
+
+> 脚本默认用的是「即时预留」，**无最低承诺，可随时取消**。
+> 若要预订未来某天（如 0703）的产能，需要带 `commitmentDuration`，那要和供给侧另行协商。
+
+---
+
+## 两个脚本共有的机型优先级
+
+默认都按**大机型优先**抢：`i4i.8xlarge → 4xlarge → 2xlarge → xlarge → large`。
+大机型一台就是一大块核（8xlarge = 32 核），凑够目标核数所需的实例数更少；抢不到大块时自动往下降级。
+内置的 vCPU 对照（用 `--types` 自定义时参考）：
+
+| 机型 | vCPU | 内存 | 本地 NVMe SSD |
+|------|------|------|----------|
+| `i4i.large` | 2 | 16 GiB | 1 × 468 GB |
+| `i4i.xlarge` | 4 | 32 GiB | 1 × 937 GB |
+| `i4i.2xlarge` | 8 | 64 GiB | 1 × 1,875 GB |
+| `i4i.4xlarge` | 16 | 128 GiB | 1 × 3,750 GB |
+| `i4i.8xlarge` | 32 | 256 GiB | 2 × 3,750 GB |
 
 ---
 
