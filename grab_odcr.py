@@ -3,7 +3,7 @@
 
 Region is configurable via --region (default: us-east-1).
 
-Strategy: sweep AZ x instance-type (small first), CreateCapacityReservation
+Strategy: sweep AZ x instance-type (large first), CreateCapacityReservation
 count=1 each (all-or-nothing per call, so count=1 scavenges fragments), tag
 each reservation, count vCPUs toward a target, stop at the cap.
 

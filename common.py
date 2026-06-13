@@ -32,13 +32,15 @@ VCPU = {
     "i4g.16xlarge": 64,
 }
 
-# Priority order: small sizes first (easier to scavenge capacity fragments).
+# Priority order: LARGE sizes first (grab big chunks to hit the core target
+# with fewer instances/reservations and fewer API calls; fall back to smaller
+# sizes when big blocks aren't available).
 DEFAULT_PRIORITY = [
-    "i4i.large",
-    "i4i.xlarge",
-    "i4i.2xlarge",
-    "i4i.4xlarge",
     "i4i.8xlarge",
+    "i4i.4xlarge",
+    "i4i.2xlarge",
+    "i4i.xlarge",
+    "i4i.large",
 ]
 
 # Errors that just mean "no capacity here, move on" — NOT a script failure.

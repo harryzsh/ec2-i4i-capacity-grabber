@@ -21,7 +21,7 @@
 两个脚本共享 `common.py`，核心思路一致：
 
 1. **自动发现** 区域内所有可用 AZ、各 AZ 的可用子网、以及每个实例类型在哪些 AZ 真正被提供（跳过不可能的调用）。
-2. **小机型优先扫描**：默认按 `i4i.large → xlarge → 2xlarge → 4xlarge → 8xlarge` 顺序，逐个 AZ 尝试。小机型更容易抢到碎片化的实时产能。
+2. **大机型优先扫描**：默认按 `i4i.8xlarge → 4xlarge → 2xlarge → xlarge → large` 顺序，逐个 AZ 尝试。大机型一台就是一大块核（8xlarge=32 核），凑够目标核数所需的实例/预留数量和 API 调用更少；抢不到大块时自动降级到小机型兜底。
 3. **逐个抢**：每次只 `count=1`，抢到一个就累加 vCPU，直到达到 `--target-cores` 目标。
 4. **智能处理**：
    - 没产能（`InsufficientInstanceCapacity` 等）→ 记一笔，换下一个 AZ/机型，不算失败。

@@ -3,7 +3,7 @@
 
 Region is configurable via --region (default: us-east-1).
 
-Strategy: sweep AZ x instance-type (small first), RunInstances count=1 each,
+Strategy: sweep AZ x instance-type (large first), RunInstances count=1 each,
 keep what launches, count vCPUs toward a target, stop at the cap. Instances
 that stay RUNNING hold their capacity — that is how plain On-Demand "holds".
 
@@ -103,7 +103,7 @@ def run(args):
     launched = []        # records
     throttle_attempt = 0
 
-    # sweep: type priority outer, AZ inner — fill cheap fragments everywhere first
+    # sweep: type priority outer (large first), AZ inner — grab big blocks first
     for itype in priority:
         if grabbed >= args.target_cores:
             break
