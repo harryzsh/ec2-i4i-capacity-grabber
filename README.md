@@ -13,6 +13,8 @@
 > ⚠️ **ODCR 不会在容量池里插队**——它和普通 On-Demand 抢的是同一个池子，没有优先级。
 > 它的价值是「抢到后即使实例停了也不还回去」，把产能锁住直到大促结束。
 
+**相关文档**：[`扩大.md`](扩大.md) 抢占前置配额清单（最该先提 `L-1216C47A`） · [`SMOKE_TEST.md`](SMOKE_TEST.md) 两份端到端验证报告。
+
 ---
 
 ## 工作原理
@@ -22,17 +24,18 @@
 1. **自动发现** 区域内所有可用 AZ、以及每个实例类型在哪些 AZ 真正被提供（跳过不可能的调用）。ODCR 创建预留**不需要子网**，所以扫**全部 AZ**；只有真正往预留里启实例时才需要对应 AZ 有子网。
 2. **默认只预留 `i4i.16xlarge`（64 核）**：一台就是一大块核，凑够目标核数所需的预留数量和 API 调用最少。需要降级兜底时，用 `--types` 显式列出其他机型，脚本会**自动按 vCPU 从大到小排序**后逐个尝试（你不用关心写的顺序）。
 3. **逐个抢**：每次只 `count=1`，抢到一个就累加 vCPU，直到达到 `--target-cores` 目标。
-4. **智能处理**：
+4. **以 AWS 实时持有为准（重启幂等）**：每轮 sweep 开头直接从 AWS 读「本脚本 tag 的预留各 AZ 已持有多少**核**」（不是预留条数），用它判断 per-AZ 上限和总目标到没到。所以进程崩溃 / 机器重启 / 打补丁后续跑，会**按各 AZ 真实持有只补差额**，绝不超抢、绝不把分布抢歪。
+5. **智能处理**：
    - 没产能（`InsufficientInstanceCapacity` 等）→ 记一笔，换下一个 AZ/机型，不算失败。
    - 被限流（`Throttling`）→ 指数退避 + 抖动后重试同一目标。
    - 其他错误 → 视为致命，立即抛出。
-5. **进度统计**：结束后打印实际预留了多少 vCPU、分布在哪些 AZ。
+6. **进度统计**：结束后打印实际预留了多少 vCPU、分布在哪些 AZ。
 
 ---
 
 ## 前置条件
 
-1. **AWS 凭证**：通过环境变量、`~/.aws/credentials` 或 IAM 角色配置好，且有权限调用 EC2 ODCR API。
+1. **AWS 凭证**：通过环境变量、`~/.aws/credentials` 或 IAM 角色配置好，且有权限调用 EC2 ODCR API。在 EC2 上 24/7 跑时**推荐用 instance profile（IAM role）**，天然对齐账号、不用拷 access key。
 2. **Python 3.8+** 和 `boto3`：
 
    ```bash
@@ -41,6 +44,28 @@
 
 3. **配额（关键！）**：真实抢 10000 核之前，必须先通过 TAM 把 i4i 的 On-Demand vCPU 配额提到 ≥ 目标值，
    否则会先撞配额上限（`VcpuLimitExceeded`）而不是产能上限。详见 [`扩大.md`](扩大.md)。
+
+### 最小 IAM 权限
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeInstanceTypeOfferings",
+      "ec2:CreateCapacityReservation",
+      "ec2:DescribeCapacityReservations",
+      "ec2:CancelCapacityReservation",
+      "ec2:CreateTags"
+    ],
+    "Resource": "*"
+  }]
+}
+```
+
+> `CreateCapacityReservation` 带了 `TagSpecifications`，所以必须给 `ec2:CreateTags`，否则建预留会被拒。
 
 ---
 
@@ -94,13 +119,13 @@ python3 grab_odcr.py --cancel-all --live
 | 参数 | 作用 | 默认值 | 示例 |
 |------|------|--------|------|
 | `--region R` | 在哪个 AWS 区域抢 | `us-east-1` | `--region us-west-2` |
-| `--target-cores N` | 预留够 N 个 vCPU 就停下 | `8` | `--target-cores 10000` |
-| `--per-az-cores N` | **均衡模式**：每个 AZ 各封顶 N 个 vCPU，某个 AZ 凑满就跳过、继续抢其余 AZ，让预留在各 AZ 间均匀分布（对齐 ASG 的 50/50 调度）。单独设此项、`--target-cores` 留默认时，总目标自动 = `N × AZ数` | 关闭（不均衡） | `--per-az-cores 5000` |
+| `--target-cores N` | 持有够 N 个 vCPU 就停下（按 AWS 实时核数判断，重启幂等） | `8` | `--target-cores 10000` |
+| `--per-az-cores N` | **均衡模式**：每个 AZ 各封顶 N 个 vCPU。上限按该 AZ **AWS 实时持有核数**判断，某 AZ 凑满就跳过、继续抢其余 AZ，让预留在各 AZ 间均匀分布（对齐 ASG 的 50/50 调度）。**进程重启后按各 AZ 真实持有只补差额，不会抢歪。** 单独设此项、`--target-cores` 留默认时，总目标自动 = `N × AZ数` | 关闭（不均衡） | `--per-az-cores 5000` |
 | `--types ...` | 机型列表，脚本**自动按 vCPU 从大到小排序**（顺序随便写）。不传 = 只预留 `i4i.16xlarge` | 只 `i4i.16xlarge` | `--types i4i.16xlarge i4i.8xlarge` |
 | `--azs ...` | 锁定只在这些 AZ 预留（写 AZ 名字）。不传 = 区域内所有 AZ | 所有 AZ | `--azs us-east-1c us-east-1d` |
 | `--end-hours N` | N 小时后预留**自动过期释放**（计费保险，防止忘关） | 不过期，直到手动取消 | `--end-hours 6` |
 | `--live` | 真正建预留。**不加 = 只演练不建**。⚠️ 加了立刻计费 | 关闭（演练） | `--live` |
-| `--watch` | 24×7 死等模式：循环重扫，直到预留够 `--target-cores` 才停 | 关闭（扫一遍就退出） | `--watch` |
+| `--watch` | 24×7 死等模式：循环重扫，每轮重读 AWS 真实持有，直到够 `--target-cores` 才停 | 关闭（扫一遍就退出） | `--watch` |
 | `--interval N` | `--watch` 模式下每轮之间隔几秒 | `60` | `--interval 30` |
 | `--cancel-all` | 取消所有预留、**停止计费**（清理用） | 关闭 | `--cancel-all --live` |
 | `--list` | 只查看当前持有的预留，不增不删 | 关闭 | `--list` |
@@ -150,10 +175,10 @@ python3 grab_odcr.py \
   --live --watch --interval 30
 ```
 
-- **`--per-az-cores 5000`**：每个 AZ 各到 5000 vCPU 就停抢、跳过去抢另一个 AZ，预留天然均衡（对齐 ASG 的 50/50 调度），不会单边堆出空转浪费。
-- **`--watch --interval 30`**：产能是间歇放出来的，每 30 秒重扫一次、死等攒满，已抢到的累加、每轮只补差额。
+- **`--per-az-cores 5000`**：每个 AZ 各到 5000 vCPU 就停抢、跳过去抢另一个 AZ，预留天然均衡（对齐 ASG 的 50/50 调度），不会单边堆出空转浪费。客户是「每 AZ 一个 ASG」时**更要用它**——让预留按各 AZ 的 ASG 目标精确铺，两边数量对齐。
+- **`--watch --interval 30`**：产能是间歇放出来的，每 30 秒重扫一次、死等攒满，每轮按 AWS 实时持有只补差额。
 - **不加 `--end-hours`**：Prime Day 要长期持有产能，不能让预留中途自动过期；用完手动 `--cancel-all` 释放。
-- 挂在 `tmux` / `nohup` 里长期跑，`Ctrl-C` 随时安全退出，已抢资源不受影响。
+- 长期跑请交给 **systemd**（见下方「24×7 在 EC2 上跑」），断了自动拉起、机器重启自启、重启续抢不超额。
 
 > 想加计费保险（比如怕忘关）可附 `--end-hours 12`，但要确保大于你实际持有时长，否则预留会提前释放。
 > 想允许降级兜底（16xl 抢不到就往下），加 `--types i4i.16xlarge i4i.8xlarge i4i.4xlarge`（脚本自动按 vCPU 从大到小排序）。
@@ -173,6 +198,60 @@ python3 grab_odcr.py \
    ```bash
    python3 grab_odcr.py --cancel-all --live
    ```
+
+---
+
+## 24×7 在 EC2 上跑（生产部署）
+
+`--watch` 已经是死循环，要 24/7 无人值守只需让它**断了能自动拉起、机器重启能自启**。推荐用一台小 EC2 + systemd。
+
+### 为什么是小 EC2 + instance profile
+
+- **账号必须 = EKS 集群账号**（open 预留只在同账号内匹配）。直接在该账号开机器、用 **instance profile** 拿凭证，天然对齐账号、不碰 access key。
+- 脚本就是「调 API → sleep → 再调」，几乎不耗资源，**`t3.micro` 足够**。（它自己也占 2 vCPU 配额，和抢占目标无关。）
+- 上线前先 `tmux` 跑一次 dry-run 肉眼确认计划，再交给 systemd 长跑。
+
+### systemd unit
+
+`/etc/systemd/system/grab-odcr.service`：
+
+```ini
+[Unit]
+Description=i4i ODCR capacity grabber (24x7 watch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/ec2-i4i-capacity-grabber
+ExecStart=/usr/bin/python3 grab_odcr.py \
+  --azs us-east-1b us-east-1d \
+  --per-az-cores 5000 \
+  --live --watch --interval 30
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now grab-odcr      # 立刻起 + 开机自启
+journalctl -u grab-odcr -f                 # 看实时日志
+```
+
+> **为什么 `Restart=always` 在这里是安全的**：脚本的 per-AZ / 总量上限都按 **AWS 实时持有核数**判断（每轮重读），不靠进程内存累加。所以无论崩溃、重启、补丁，拉起后都会按各 AZ 真实持有**只补差额**——不会超抢、不会抢歪分布。抢满目标后 watch 循环自然停在那里空转重扫（不再建预留），大促结束 `systemctl stop` + `--cancel-all` 收尾即可。
+
+### 收尾
+
+```bash
+sudo systemctl stop grab-odcr              # 先停 watcher
+sudo systemctl disable grab-odcr           # 取消开机自启
+python3 grab_odcr.py --cancel-all --live   # 释放全部预留、停止计费（最关键的止血）
+```
 
 ---
 
@@ -240,7 +319,7 @@ aws autoscaling update-auto-scaling-group \
 ## EKS 自建节点组（self-managed node group）专项
 
 > 本节针对客户实际架构：**EKS 自建节点组**，**自管 auto scaler**（非 Kubernetes Cluster Autoscaler），**每个 AZ 一个 ASG**。
-> 这套架构天然规避了原本 6 个坑里的 2 个（AZRebalance、跨 AZ 调度）。EC2 层抢货机制不变（已 Smoke Test 验证），剩下的 Kubernetes 层风险**收敛到一条**：自管 scaler 在低负载时把节点缩下去，把抢到的 i4i 还回 AWS。
+> 这套架构天然规避了原本 6 个坑里的 2 个（AZRebalance、跨 AZ 调度）。EC2 层抢货机制不变（已端到端验证，见 [`SMOKE_TEST.md`](SMOKE_TEST.md)），剩下的 Kubernetes 层风险**收敛到一条**：自管 scaler 在低负载时把节点缩下去，把抢到的 i4i 还回 AWS。
 
 ### 本脚本的定位：只抢预留，绝不碰 ASG（写死）
 
@@ -249,7 +328,7 @@ aws autoscaling update-auto-scaling-group \
 | 脚本动作 | 调用的 AWS API |
 |----------|----------------|
 | 抢预留 | `create_capacity_reservation` |
-| `--list` 查看 | `describe_capacity_reservations` |
+| `--list` / gate 读实时核数 | `describe_capacity_reservations` |
 | `--cancel-all` 释放 | `cancel_capacity_reservation` |
 
 > ✅ 客户已有的 EKS 节点组（ASG / 启动模板 / 节点）**脚本一律不读、不改、不删**。抢到的是 `open` 模式预留，客户节点组只要设了 `capacity-reservations-first` 就会自动 open-match 吸纳，两边各管各的、互不干涉。
@@ -270,7 +349,7 @@ python3 grab_odcr.py --list
 python3 grab_odcr.py --cancel-all --live
 ```
 
-抢到的预留即 `open` 模式，客户节点组的 ASG 自动吸纳，脚本无需也不会触碰 ASG。
+抢到的预留即 `open` 模式，客户节点组的 ASG 自动吸纳，脚本无需也不会触碰 ASG。生产建议挂 systemd 长跑，见上方「24×7 在 EC2 上跑」。
 
 ### ✅ 客户架构已规避的两个坑
 
@@ -310,7 +389,7 @@ aws autoscaling update-auto-scaling-group \
 
 EC2 层硬阻塞（错一个整个方案归零，**最优先**）：
 
-- [ ] **抢预留的账号 = EKS 集群账号**（open 预留只在同账号内匹配；Smoke Test 在 `476114114317`）
+- [ ] **抢预留的账号 = EKS 集群账号**（open 预留只在同账号内匹配；验证在 `476114114317`）
 - [ ] **该账号 On-Demand Standard vCPU 配额已提到 ≥10000**（156 台 = 9984 vCPU，建议提到 12000 含回落余量；默认配额远不够 → 提早开 quota 工单，**头号硬阻塞**，详见 [`扩大.md`](扩大.md)）
 - [ ] **两个 ASG 的子网确实在 1b + 1d**（不在则改抢对应 AZ）
 - [ ] 启动模板只锁 `i4i.16xlarge`、`Linux/UNIX`、`default` 租户、x86_64 AMI
@@ -328,248 +407,30 @@ EC2 层硬阻塞（错一个整个方案归零，**最优先**）：
 
 ---
 
-## Smoke Test 验证报告
+## 验证报告
 
-为了在真金白银抢 i4i 之前，先确认「**open 预留 + ASG `capacity-reservations-first` → 实例自动落进预留**」这套机制确实成立，跑了一次端到端 smoke test。
+抢货机制已端到端实测通过，两份报告整理在 **[`SMOKE_TEST.md`](SMOKE_TEST.md)**：
 
-### 关键设计决策：用 t3.micro，不用 i4i.16xlarge
+1. **Smoke Test 1（t3.micro 验机制）**：证明「open 预留 + ASG `capacity-reservations-first` → 实例自动落进预留」这套链路成立。机制与机型无关，对 t3.micro 成立即对 i4i.16xlarge 成立。全程 < $0.05。
+2. **Smoke Test 2（真 i4i.16xlarge 验分布）**：6 台 i4i.16xlarge 一次全抢到、ASG 拉起、**完美 3+3 两 AZ 均衡**、每台落进对应 AZ 预留（Available 3→0）。计费窗口 ~3.1 分钟，≈ $1.70，零残留。
 
-| 维度 | 说明 |
-|------|------|
-| **验证目标** | 验的是 ASG 吃预留的**机制**，不是 i4i 容量本身 |
-| **为什么换机型** | `capacity-reservations-first` 的匹配逻辑**与机型无关**——对 t3.micro 成立，对 i4i.16xlarge 必然同样成立 |
-| **成本** | t3.micro 2 台 + 2 个预留跑几分钟，全程 **< $0.05**；i4i.16xlarge 2 台约 $11/小时，且本来就可能抢不到容量，反而干扰结论 |
-| **容量** | t3.micro 容量稳拿，不会卡在「抢不到」上，确保测的是机制而非运气 |
-
-> ⚠️ 注意区分：本测试证明的是**机制链路**。Prime Day 真跑 i4i 时，能不能**抢到** i4i 预留是另一回事（取决于 AWS 池子有无货，靠 `grab_odcr.py --watch` 死等解决）。但只要预留抢到了，ASG 一定能把它吃进去——这一点已实锤。
-
-### 测试步骤（我实际做的）
-
-环境：`us-east-1`，账户 `476114114317`，默认 VPC（`vpc-02f8...52d0`，原本只有 1c 一个子网）。所有资源打 `purpose=primeday-smoke-test` 标签，便于一键拆除。
-
-1. **建子网**：默认 VPC 在 1b/1d 没子网，临时各建一个（`172.31.16.0/20`@1b、`172.31.32.0/20`@1d）。
-2. **建 open 预留**：在 1b、1d 各建 1 个 `t3.micro` 容量预留，`platform=Linux/UNIX`、`tenancy=default`、`instance-match-criteria=open`（与生产 ODCR 同模式）。
-3. **建启动模板**：AL2023 AMI（x86_64）、`t3.micro`、默认 SG。
-4. **建 ASG**：横跨两个子网，`min=0 / max=2 / desired=0`，`CapacityReservationPreference=capacity-reservations-first`。
-5. **记录基线**：两个预留 `Available=1`、未使用。
-6. **触发扩容**：`set-desired-capacity --desired-capacity 2`，等约 90 秒实例起来。
-7. **双向取证**（见下）。
-8. **拆除**：删 ASG（force，连带终止实例）→ 取消两个预留（停计费）→ 删启动模板 → 删游离 ENI → 删两个子网。
-
-### 结果：✅ 通过
-
-两侧证据对得上，机制确认无误：
-
-| 视角 | us-east-1b | us-east-1d |
-|------|-----------|-----------|
-| 实例的 `CapacityReservationId` | → `cr-…aa28` ✓ | → `cr-…459` ✓ |
-| 预留 `Available`（扩容前 → 后） | 1 → **0** | 1 → **0** |
-
-- **实例侧**：两台实例的 `CapacityReservationId` 字段直接写着对应 AZ 的预留 ID——实例自己记录了它落进了哪个预留。
-- **预留侧**：两个预留的可用槽位同步从 1 掉到 **0**，证明槽位被实例占满。
-- > 小注：CLI 表格里 `UsedInstanceCount` 字段渲染成 `null`/`None` 是 API 的显示怪癖，但 `Total(1) − Available(0) = 1` 在数学上就是「被占用 1 个」，结论不受影响。
-
-### 清理结果：零残留
-
-拆除后扫描 5 类资源（实例 / 预留 / 启动模板 / ASG / 子网），**全部为空**，无任何持续计费资源遗留。子网首次删除时因实例刚终止、ENI 未释放报 `DependencyViolation`，等 ENI 被 AWS 自动回收后重删成功——这是正常的资源释放时序。
-
----
-
-## Smoke Test 2：真 i4i.16xlarge 端到端实测报告
-
-第一份报告用 t3.micro 验证了**机制**。这一份是**真金白银的 i4i.16xlarge 实测**——直接抢真机型、用 ASG 拉起、看 AZ 分布对不对。
-
-### 实验设计
-
-| 项 | 值 |
-|----|----|
-| 机型 | **i4i.16xlarge**（64 vCPU、512 GiB / 台） |
-| 规模 | **6 台 = 384 vCPU**，两 AZ 均衡 **3 + 3** |
-| AZ | `us-east-1b` / `us-east-1d` |
-| 单价 | $5.491/h·台（us-east-1 官方价） |
-| 验证目标 | ① i4i 现货能否抢到 ② ASG 能否拉起 ③ **6 台 AZ 分布是否 3+3 均衡** ④ 每台是否落进对应 AZ 的预留 |
-| 实际耗时/成本 | 计费窗口 ~3.1 分钟，总花费 **≈ $1.70** |
-| 环境 | 账户 `476114114317`，默认 VPC `vpc-02f8425260c9c52d0`，所有资源打 `purpose=primeday-smoke2` 标签 |
-
-> ⚠️ **ODCR 一创建就按台计费**（不管实例起没起）。所以流程上先把不花钱的资源（子网、启动模板）全搭好，**最后**才建预留，验完立刻拆，把计费窗口压到最短。
-
-### 完整命令流水（实际跑的，原样保留）
-
-变量约定（实测取值）：`AMI=ami-0521cb2d60cfbb1a6`(AL2023 x86_64)、`SG=sg-0380d51a3f9beb58c`、`SUB_1B=subnet-08a5399b09024d72c`、`SUB_1D=subnet-0e02f5af0269387ca`、`LT=lt-05aa1876395b2a26e`、`CR_1B=cr-0cbbf7a21e7a9ddbf`、`CR_1D=cr-037eb8095c0f22881`。
-
-#### 第 0 步：环境侦察（不花钱）
-```bash
-# 账户 / 默认 VPC / 现有子网 / AL2023 x86_64 AMI / 默认 SG
-aws sts get-caller-identity --query Account --output text --region us-east-1
-aws ec2 describe-vpcs --region us-east-1 --filters Name=isDefault,Values=true \
-  --query 'Vpcs[0].VpcId' --output text
-aws ssm get-parameter --region us-east-1 \
-  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-  --query 'Parameter.Value' --output text
-aws ec2 describe-security-groups --region us-east-1 \
-  --filters Name=vpc-id,Values=$VPC Name=group-name,Values=default \
-  --query 'SecurityGroups[0].GroupId' --output text
-```
-
-#### 第 1 步：建 1b/1d 子网（默认 VPC 原本只有 1c，不花钱）
-```bash
-aws ec2 create-subnet --region us-east-1 --vpc-id $VPC \
-  --cidr-block 172.31.48.0/20 --availability-zone us-east-1b \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=purpose,Value=primeday-smoke2}]'
-aws ec2 create-subnet --region us-east-1 --vpc-id $VPC \
-  --cidr-block 172.31.64.0/20 --availability-zone us-east-1d \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=purpose,Value=primeday-smoke2}]'
-```
-
-#### 第 2 步：建 i4i 启动模板（不花钱）
-```bash
-aws ec2 create-launch-template --region us-east-1 \
-  --launch-template-name primeday-smoke2-i4i \
-  --tag-specifications 'ResourceType=launch-template,Tags=[{Key=purpose,Value=primeday-smoke2}]' \
-  --launch-template-data '{"ImageId":"'$AMI'","InstanceType":"i4i.16xlarge","SecurityGroupIds":["'$SG'"],"TagSpecifications":[{"ResourceType":"instance","Tags":[{"Key":"purpose","Value":"primeday-smoke2"}]}]}'
-```
-
-#### 第 3 步：建 i4i ODCR（⚠️ 此刻开始计费）
-```bash
-# 每 AZ 各建 1 个 open 预留，instance-count=3
-aws ec2 create-capacity-reservation --region us-east-1 \
-  --instance-type i4i.16xlarge --instance-platform Linux/UNIX \
-  --availability-zone us-east-1b --instance-count 3 --tenancy default \
-  --instance-match-criteria open --end-date-type unlimited \
-  --tag-specifications 'ResourceType=capacity-reservation,Tags=[{Key=purpose,Value=primeday-smoke2}]'
-aws ec2 create-capacity-reservation --region us-east-1 \
-  --instance-type i4i.16xlarge --instance-platform Linux/UNIX \
-  --availability-zone us-east-1d --instance-count 3 --tenancy default \
-  --instance-match-criteria open --end-date-type unlimited \
-  --tag-specifications 'ResourceType=capacity-reservation,Tags=[{Key=purpose,Value=primeday-smoke2}]'
-```
-**核实预留全抢到**（关键节点：抢不全就停下报告现货情况）：
-```bash
-aws ec2 describe-capacity-reservations --region us-east-1 \
-  --filters Name=tag:purpose,Values=primeday-smoke2 Name=state,Values=active \
-  --query 'CapacityReservations[].[CapacityReservationId,AvailabilityZone,TotalInstanceCount,AvailableInstanceCount,State]' \
-  --output table
-```
-```
-+-----------------------+-------------+----+----+----------+
-|  cr-037eb8095c0f22881 |  us-east-1d |  3 |  3 |  active  |   ← 1d 3/3 ✓
-|  cr-0cbbf7a21e7a9ddbf |  us-east-1b |  3 |  3 |  active  |   ← 1b 3/3 ✓
-+-----------------------+-------------+----+----+----------+
-```
-✅ **6 台 i4i.16xlarge 一次全抢到**——证明本次 us-east-1 的 i4i 现货充足。
-
-#### 第 4 步：起 ASG（核心 —— 怎么拉起）
-```bash
-aws autoscaling create-auto-scaling-group --region us-east-1 \
-  --auto-scaling-group-name primeday-smoke2-asg \
-  --launch-template "LaunchTemplateId=$LT,Version=\$Latest" \
-  --min-size 0 --max-size 6 --desired-capacity 6 \
-  --vpc-zone-identifier "$SUB_1B,$SUB_1D" \
-  --capacity-reservation-specification "CapacityReservationPreference=capacity-reservations-first" \
-  --tags "Key=purpose,Value=primeday-smoke2,PropagateAtLaunch=true"
-```
-要点：
-- **`--desired-capacity 6`** 一次拉满，ASG 自己往两 AZ 均衡放。
-- **`--vpc-zone-identifier "$SUB_1B,$SUB_1D"`** 横跨两 AZ 子网——这是 ASG 能 3+3 分布的前提。
-- **`CapacityReservationPreference=capacity-reservations-first`** 设在 ASG 上——让实例优先吃 open 预留。
-- 不指定具体预留 ID，靠属性匹配（机型/平台/AZ/租户）自动落入。
-
-#### 第 5 步：核实（双向取证 —— 怎么核实）
-等约 90 秒实例 running，然后**两个方向**对证：
-
-**(a) 实例侧** —— 看每台落在哪个 AZ、落进哪个预留：
-```bash
-aws ec2 describe-instances --region us-east-1 \
-  --filters Name=tag:purpose,Values=primeday-smoke2 Name=instance-state-name,Values=pending,running \
-  --query 'Reservations[].Instances[].[InstanceId,Placement.AvailabilityZone,State.Name,CapacityReservationId]' \
-  --output table
-```
-```
-+----------------------+-------------+----------+------------------------+
-|  i-03bedfa1a9cd0d3aa |  us-east-1d |  running |  cr-037eb8095c0f22881  |
-|  i-0aac963125478a5c2 |  us-east-1d |  running |  cr-037eb8095c0f22881  |
-|  i-00fcc38325042f08d |  us-east-1d |  running |  cr-037eb8095c0f22881  |
-|  i-0ffb18a55a627faf3 |  us-east-1b |  running |  cr-0cbbf7a21e7a9ddbf  |
-|  i-0ee18df9de7670407 |  us-east-1b |  running |  cr-0cbbf7a21e7a9ddbf  |
-|  i-09039679d99f6096d |  us-east-1b |  running |  cr-0cbbf7a21e7a9ddbf  |
-+----------------------+-------------+----------+------------------------+
-```
-**AZ 分布计数**：
-```bash
-aws ec2 describe-instances --region us-east-1 \
-  --filters Name=tag:purpose,Values=primeday-smoke2 Name=instance-state-name,Values=pending,running \
-  --query 'Reservations[].Instances[].Placement.AvailabilityZone' --output text \
-  | tr '\t' '\n' | sort | uniq -c
-#       3 us-east-1b
-#       3 us-east-1d
-```
-
-**(b) 预留侧** —— 看可用槽位被占满（3 → 0）：
-```bash
-aws ec2 describe-capacity-reservations --region us-east-1 \
-  --filters Name=tag:purpose,Values=primeday-smoke2 Name=state,Values=active \
-  --query 'CapacityReservations[].[CapacityReservationId,AvailabilityZone,TotalInstanceCount,AvailableInstanceCount]' \
-  --output table
-```
-```
-+-----------------------+--------------+----+----+
-|  cr-037eb8095c0f22881 |  us-east-1d  |  3 |  0 |   ← Available 3→0
-|  cr-0cbbf7a21e7a9ddbf |  us-east-1b  |  3 |  0 |   ← Available 3→0
-+-----------------------+--------------+----+----+
-```
-
-#### 第 6 步：拆除（停止计费）
-```bash
-# 1. 删 ASG（force 连带终止 6 台实例）
-aws autoscaling delete-auto-scaling-group --region us-east-1 \
-  --auto-scaling-group-name primeday-smoke2-asg --force-delete
-sleep 60                                  # 等实例终止、ENI 释放
-# 2. 取消两个预留（停止按台计费 —— 最关键的止血动作）
-aws ec2 cancel-capacity-reservation --region us-east-1 --capacity-reservation-id $CR_1B
-aws ec2 cancel-capacity-reservation --region us-east-1 --capacity-reservation-id $CR_1D
-# 3. 删启动模板
-aws ec2 delete-launch-template --region us-east-1 --launch-template-id $LT
-# 4. 删两个子网（实例终止快、ENI 已释放，本次首删即成）
-aws ec2 delete-subnet --region us-east-1 --subnet-id $SUB_1B
-aws ec2 delete-subnet --region us-east-1 --subnet-id $SUB_1D
-```
-**零残留扫描**（实例/预留/启动模板/ASG/子网/游离 ENI 六项全空）：
-```bash
-aws ec2 describe-instances --region us-east-1 --filters Name=tag:purpose,Values=primeday-smoke2 \
-  Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down --query 'Reservations[].Instances[].InstanceId' --output text
-aws ec2 describe-capacity-reservations --region us-east-1 --filters Name=tag:purpose,Values=primeday-smoke2 \
-  Name=state,Values=active,pending --query 'CapacityReservations[].CapacityReservationId' --output text
-# ...启动模板 / ASG / 子网 / ENI 同理，全部返回空
-```
-
-### 结论
-
-| 验证项 | 结果 |
-|--------|------|
-| **i4i.16xlarge 现货能否抢到** | ✅ 6 台一次全抢到（1b 3/3、1d 3/3），本次 us-east-1 现货充足 |
-| **ASG 能否拉起** | ✅ 6 台全部 `running` |
-| **AZ 分布是否 3+3 均衡** | ✅ **完美 3 + 3**（1b 3 台、1d 3 台），ASG 自动均衡 |
-| **每台是否落进对应 AZ 预留** | ✅ 全部命中：1b 3 台→`cr-…ddbf`，1d 3 台→`cr-…2881`；预留 Available 同步 3→0 |
-| **成本控制** | ✅ 计费窗口 ~3.1 分钟，总花费 **≈ $1.70** |
-| **零残留** | ✅ 六类资源扫描全空，无持续计费遗留 |
-
-**一句话**：真 i4i.16xlarge 上，`grab_odcr.py` 抢预留 + ASG `capacity-reservations-first` + 跨两 AZ 子网 = 实例**自动 3+3 均衡落进预留**，机制与分布双双验证通过。Prime Day 把规模从 6 台放大到 ~156 台（10000 vCPU）即可，命令结构完全一致。
+> 两份都验的是「抢到预留后能不能用上」；**能不能抢到** i4i 现货是另一回事（取决于 AWS 池子，靠 `--watch` 死等）。Prime Day 把规模从 6 台放大到 ~156 台即可，命令结构完全一致。
 
 ---
 
 ## 24×7 死等模式（`--watch`）
 
 产能不是一直有的，AWS 会**间歇性**地把回收的 i4i 放回池子——可能凌晨某几分钟突然有一批，几秒后又被别人抢光。
-单次扫描很可能空手而归。`--watch` 让脚本**循环重扫**，每隔 `--interval` 秒再扫一遍，直到抢够 `--target-cores` 才停，这才是真正能把产能攒起来的用法。
+单次扫描很可能空手而归。`--watch` 让脚本**循环重扫**，每隔 `--interval` 秒再扫一遍（每轮重读 AWS 真实持有），直到抢够 `--target-cores` 才停，这才是真正能把产能攒起来的用法。
 
 ```bash
 # 每 30 秒重扫一次，死等到凑够 10000 vCPU；配合 --end-hours 做计费保险
 python3 grab_odcr.py --target-cores 10000 --live --watch --interval 30 --end-hours 6
 ```
 
-- 已抢到的会累加，每轮只补差额，不会重复抢。
+- 每轮按 AWS 实时持有只补差额，不会重复抢；进程重启也按各 AZ 真实持有续抢，不超额。
 - `Ctrl-C` 随时安全退出，已抢到的资源不受影响（已记在日志和台账里）。
-- 适合挂在 `tmux` / `screen` / `nohup` 里长期跑，或交给 systemd / cron 托管。
+- 长期跑请交给 **systemd**（见上方「24×7 在 EC2 上跑」），它解决自动重启 + 开机自启。
 
 ---
 
@@ -612,6 +473,7 @@ python3 grab_odcr.py --target-cores 10000 --live --watch --interval 30 --end-hou
 ├── common.py          # 共享工具：AZ 发现、机型 offering 探测、退避重试、vCPU 计数、错误分类、日志与台账
 ├── grab_odcr.py       # ODCR 预留抢占脚本（唯一抢占脚本）
 ├── 扩大.md            # 抢占前置配额清单（最该先提 L-1216C47A）
+├── SMOKE_TEST.md      # 两份端到端验证报告（t3.micro 验机制 + 真 i4i.16xlarge 验分布）
 ├── logs/              # 运行日志（自动轮转）+ 抢占台账 grabs.jsonl（首次运行自动生成）
 ├── requirements.txt   # 依赖（boto3）
 └── README.md
@@ -620,5 +482,5 @@ python3 grab_odcr.py --target-cores 10000 --live --watch --interval 30 --end-hou
 ## 成本参考
 
 - `i4i.16xlarge` = **$5.491/小时**（us-east-1 参考价，On-Demand，按秒计费，最低 60 秒），64 vCPU。价格随区域不同，以 AWS Pricing API 实时为准。
-- 实弹验证已通过：Smoke Test 2 真起了 6 台 i4i.16xlarge，计费窗口 ~3.1 分钟，总花费 ≈ $1.70。
+- 实弹验证已通过：Smoke Test 2 真起了 6 台 i4i.16xlarge，计费窗口 ~3.1 分钟，总花费 ≈ $1.70（详见 [`SMOKE_TEST.md`](SMOKE_TEST.md)）。
 - `--region` 已在 us-east-1 / us-west-2 验证可正常发现各自的 AZ 与机型 offering。
