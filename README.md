@@ -185,15 +185,21 @@ python3 grab_odcr.py --cancel-all --live
 
 ## 监控：看抢了多少
 
-跑起来后，有三个地方看进度，各管一件事：
+三个出口，各回答一个不同的问题——**平时只用第 ①个就够**，②③ 是排查/对账才用：
 
-**① 看「目前总共抢了多少核、每个 AZ 多少」——最权威，直接问 AWS：**
+| 想知道 | 用哪个 | 数据来自 |
+|--------|--------|----------|
+| ① **现在总共抢了多少核、每个 AZ 多少**（最常看） | `python3 grab_odcr.py --list` | 实时问 AWS |
+| ② **脚本此刻在干啥、为啥没抢到**（排查用） | `journalctl` 或 `tail` 看运行日志 | 脚本运行流水 |
+| ③ **每一笔抢占的明细**（事后对账用） | 读 `logs/grabs.jsonl` 台账 | 脚本写的本地文件 |
+
+### ① 抢到多少 —— 最权威，直接问 AWS
 
 ```bash
 python3 grab_odcr.py --list
 ```
 
-输出 = 每条预留 + 一个汇总块：
+输出 = 每条预留 + 一个汇总块（这就是「抢到哪了」的标准答案，按**核数**算、只统计本脚本 tag 的预留）：
 
 ```
 cr-0aaa...  i4i.16xlarge  us-east-1b  active  count=78  tag=primeday-i4i-grab
@@ -204,25 +210,32 @@ cr-0bbb...  i4i.16xlarge  us-east-1d  active  count=78  tag=primeday-i4i-grab
   TOTAL         9984 vCPU  across 2 AZ(s)
 ```
 
-> 按**核数**算（不是预留条数），只统计本脚本 tag 的预留。这就是「抢到哪了」的标准答案。
-
-**② 看「脚本此刻在干啥」——实时流水：**
+### ② 脚本此刻在干啥 —— 运行日志
 
 ```bash
-journalctl -u grab-odcr -f          # systemd 跑的看这个
-tail -f logs/grab_odcr.log          # 直接跑的看这个（脚本目录下）
+journalctl -u grab-odcr -f          # 用 systemd 跑的，看这个
+tail -f logs/grab_odcr.log          # 直接 / tmux 跑的，看这个（脚本目录下）
 ```
 
-每轮打印扫了哪些 AZ、抢到/没抢到、限流退避、`have X/10000 vCPU` 进度。
+> **这两条看的是同一份日志的两个出口**，内容一样，按你怎么跑脚本二选一：
+> 脚本同时把日志吐到「控制台」和「文件 `logs/grab_odcr.log`」。systemd 跑时控制台被它接管、只能用 `journalctl` 看（机器重启后历史还在）；直接跑时没有 systemd unit，就 `tail` 文件。
+> 内容：每轮扫了哪些 AZ、抢到/没抢到、限流退避、`have X/10000 vCPU` 进度。
 
-**③ 看「抢占明细台账」——对账用：**
+### ③ 抢占明细台账 —— 对账用
+
+`logs/grabs.jsonl` 是**机器可读的流水账**：每真正抢到一个预留，就追加一行 JSON。它和 ① 的区别是——① 给你「此刻的总数」，③ 给你「每一笔什么时候抢到的、攒的过程」，适合事后对账、画曲线、喂给别的工具。dry-run 不写，所以这里只会有真实抢占。
 
 ```bash
-wc -l logs/grabs.jsonl              # 一共抢到多少笔（每抢到一个一行）
-cat  logs/grabs.jsonl               # 每行一条 JSON：时间戳/机型/AZ/累计 vCPU
+wc -l logs/grabs.jsonl                       # 一共抢到多少笔（每笔一行）
+tail -n 5 logs/grabs.jsonl                   # 看最近 5 笔（别用 cat，几百行糊一屏）
+tail -n 1 logs/grabs.jsonl | python3 -m json.tool   # 把最新一笔格式化看清字段
 ```
 
-> dry-run 不写台账，`grabs.jsonl` 只记真实抢占，干净可审计。
+一行长这样（`total_vcpu` = 抢到这笔时的累计核数）：
+
+```json
+{"ts":"2026-06-13T07:12:16Z","via":"odcr","instance_type":"i4i.16xlarge","az":"us-east-1b","region":"us-east-1","vcpu":64,"total_vcpu":64,"target_vcpu":10000}
+```
 
 ---
 
