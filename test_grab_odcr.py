@@ -331,6 +331,8 @@ class ReserveOne(unittest.TestCase):
         self.assertEqual(kw["InstanceMatchCriteria"], "open")
         self.assertEqual(kw["Tenancy"], "default")
         self.assertEqual(kw["DryRun"], False)
+        # i4i is Nitro (always EBS-optimized); reservation marked to match.
+        self.assertEqual(kw["EbsOptimized"], True)
         # tagged so --list / --cancel-all / held_cores can find it
         tags = kw["TagSpecifications"][0]["Tags"]
         self.assertIn({"Key": TAG_KEY, "Value": TAG_VAL}, tags)
