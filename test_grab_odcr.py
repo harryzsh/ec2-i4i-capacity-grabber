@@ -10,15 +10,19 @@ pure-Python core that makes a crash/restart safe —
   * sweep_once(): ONE grab per AZ per pass; the --watch loop repeats sweeps to
     fill up. After a restart, full AZs are skipped and only the short ones get
     topped up — never double-grab a full AZ, never go lopsided.
-  * print_list(): --list prints a per-AZ + total CORE summary (optional target).
+  * print_list(): --list prints a per-AZ + total CORE summary (optional target,
+    auto-read from the ledger).
   * reserve_one() / list_reservations() / cancel_all(): the 3 ODCR API wrappers.
 
 Run:  python3 -m unittest test_grab_odcr -v
 """
 import datetime
 import logging
+import os
+import tempfile
 import unittest
 from argparse import Namespace
+from unittest import mock
 
 from botocore.exceptions import ClientError
 
@@ -182,14 +186,36 @@ class PrintListSummary(unittest.TestCase):
         self.assertIn("[FULL]", out)           # 1d at/over cap
         self.assertIn("576 / 640 vCPU", out)   # total progress
 
-    def test_summary_no_target_keeps_plain_format(self):
-        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 1)])
-        with self.assertLogs("i4i-grab", level="INFO") as cm:
-            print_list(client)                 # no targets
+    def test_summary_no_target_and_no_ledger_keeps_plain_format(self):
+        # point ledger at an empty/missing file so no target is auto-read
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(grab_odcr, "GRAB_LEDGER",
+                                   os.path.join(d, "nope.jsonl")):
+                client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 1)])
+                with self.assertLogs("i4i-grab", level="INFO") as cm:
+                    print_list(client)                 # no targets, no ledger
         out = "\n".join(cm.output)
         self.assertNotIn("/", out.split("summary")[-1])  # no "held / target"
         self.assertNotIn("[FULL]", out)
         self.assertNotIn("[short]", out)
+
+    def test_list_auto_reads_target_from_ledger(self):
+        # plain print_list() with NO target args should read target from the
+        # last grabs.jsonl line — so `--list` alone shows progress.
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "grabs.jsonl")
+            with open(ledger, "w") as f:
+                f.write('{"target_vcpu":10000,"per_az_cores":5000}\n')
+            with mock.patch.object(grab_odcr, "GRAB_LEDGER", ledger):
+                client = FakeEC2([
+                    _reservation("i4i.16xlarge", "us-east-1b", 6),  # 384
+                    _reservation("i4i.16xlarge", "us-east-1d", 6),  # 384
+                ])
+                with self.assertLogs("i4i-grab", level="INFO") as cm:
+                    print_list(client)                 # NO args passed
+        out = "\n".join(cm.output)
+        self.assertIn("384 / 5000 vCPU", out)   # per-AZ target auto-read
+        self.assertIn("768 / 10000 vCPU", out)  # total target auto-read
 
 
 class AzFull(unittest.TestCase):
