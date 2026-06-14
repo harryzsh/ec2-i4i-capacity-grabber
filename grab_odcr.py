@@ -66,6 +66,13 @@ def reserve_one(client, itype, az, dry_run, end_hours=None):
         InstanceCount=1,
         InstanceMatchCriteria="open",
         Tenancy="default",
+        # i4i is a Nitro family — EBS optimization is always-on and can't be
+        # disabled. Mark the reservation EBS-optimized so its attributes match
+        # the instances it will hold. NOTE: EbsOptimized is NOT one of the
+        # `open` match criteria (those are instance type / platform / AZ /
+        # tenancy only), so this neither helps nor blocks matching — it's set
+        # for honest attribute alignment, not for placement.
+        EbsOptimized=True,
         DryRun=dry_run,
         TagSpecifications=[{
             "ResourceType": "capacity-reservation",
