@@ -10,6 +10,7 @@ pure-Python core that makes a crash/restart safe —
   * sweep_once(): ONE grab per AZ per pass; the --watch loop repeats sweeps to
     fill up. After a restart, full AZs are skipped and only the short ones get
     topped up — never double-grab a full AZ, never go lopsided.
+  * print_list(): --list prints a per-AZ + total CORE summary.
 
 Run:  python3 -m unittest test_grab_odcr -v
 """
@@ -20,7 +21,9 @@ from argparse import Namespace
 from botocore.exceptions import ClientError
 
 import grab_odcr
-from grab_odcr import held_cores_by_az, _az_full, sweep_once, TAG_KEY, TAG_VAL
+from grab_odcr import (
+    held_cores_by_az, _az_full, sweep_once, print_list, TAG_KEY, TAG_VAL,
+)
 from common import VCPU
 
 # Quiet the script's INFO chatter during tests; we assert on state, not logs.
@@ -127,6 +130,32 @@ class HeldCoresByAz(unittest.TestCase):
     def test_skips_unknown_instance_type(self):
         client = FakeEC2([_reservation("c7gd.metal", "us-east-1b", 2)])
         self.assertEqual(held_cores_by_az(client), {})
+
+
+class PrintListSummary(unittest.TestCase):
+    """--list must print a per-AZ + total CORE summary (not just rows)."""
+
+    def test_summary_logs_per_az_and_total_cores(self):
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),   # 192
+            _reservation("i4i.16xlarge", "us-east-1d", 2),   # 128
+            _reservation("i4i.16xlarge", "us-east-1d", 1),   #  64 -> 1d=192
+            _reservation("i4i.16xlarge", "us-east-1c", 5, tag=None),  # not ours
+        ])
+        with self.assertLogs("i4i-grab", level="INFO") as cm:
+            print_list(client)
+        out = "\n".join(cm.output)
+        self.assertIn("us-east-1b", out)
+        self.assertIn("192 vCPU", out)              # per-AZ core count shown
+        self.assertIn("TOTAL", out)
+        self.assertIn("384 vCPU", out)              # 192+192, untagged excluded
+        self.assertIn("across 2 AZ(s)", out)        # 1c (untagged) not counted
+
+    def test_empty_says_none(self):
+        client = FakeEC2([])
+        with self.assertLogs("i4i-grab", level="INFO") as cm:
+            print_list(client)
+        self.assertIn("no active/pending reservations", "\n".join(cm.output))
 
 
 class AzFull(unittest.TestCase):
