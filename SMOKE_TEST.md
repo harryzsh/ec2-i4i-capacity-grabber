@@ -24,7 +24,7 @@
 
 ### 测试步骤（实际执行）
 
-环境：`us-east-1`，账户 `476114114317`，默认 VPC（`vpc-02f8...52d0`，原本只有 1c 一个子网）。所有资源打 `purpose=primeday-smoke-test` 标签，便于一键拆除。
+环境：`us-east-1`，账户 `<ACCOUNT_ID>`，默认 VPC（`vpc-02f8...52d0`，原本只有 1c 一个子网）。所有资源打 `purpose=primeday-smoke-test` 标签，便于一键拆除。
 
 1. **建子网**：默认 VPC 在 1b/1d 没子网，临时各建一个（`172.31.16.0/20`@1b、`172.31.32.0/20`@1d）。
 2. **建 open 预留**：在 1b、1d 各建 1 个 `t3.micro` 容量预留，`platform=Linux/UNIX`、`tenancy=default`、`instance-match-criteria=open`（与生产 ODCR 同模式）。
@@ -68,7 +68,7 @@
 | 单价 | $5.491/h·台（us-east-1 官方价） |
 | 验证目标 | ① i4i 现货能否抢到 ② ASG 能否拉起 ③ **6 台 AZ 分布是否 3+3 均衡** ④ 每台是否落进对应 AZ 的预留 |
 | 实际耗时/成本 | 计费窗口 ~3.1 分钟，总花费 **≈ $1.70** |
-| 环境 | 账户 `476114114317`，默认 VPC `vpc-02f8425260c9c52d0`，所有资源打 `purpose=primeday-smoke2` 标签 |
+| 环境 | 账户 `<ACCOUNT_ID>`，默认 VPC `vpc-02f8425260c9c52d0`，所有资源打 `purpose=primeday-smoke2` 标签 |
 
 > ⚠️ **ODCR 一创建就按台计费**（不管实例起没起）。所以流程上先把不花钱的资源（子网、启动模板）全搭好，**最后**才建预留，验完立刻拆，把计费窗口压到最短。
 
