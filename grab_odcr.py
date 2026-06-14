@@ -180,7 +180,8 @@ def _on_grab(args, crid, itype, az, held, made):
         log.info("RESERVED %s %s @ %s (+%d vCPU, total %d/%d)",
                  crid, itype, az, VCPU[itype], total, args.target_cores)
     record_grab("odcr", itype, az, VCPU[itype], total,
-                args.target_cores, args.region, not args.live)
+                args.target_cores, args.region, not args.live,
+                per_az_cores=args.per_az_cores, per_az_total=held[az])
 
 
 def _az_full(args, held, az):
