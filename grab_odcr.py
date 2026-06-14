@@ -114,6 +114,31 @@ def held_cores_by_az(client):
     return held
 
 
+def print_list(client):
+    """--list: show every tagged reservation, then a per-AZ + total summary.
+
+    The summary answers the two questions you actually have during a grab:
+    "how many cores do I hold total?" and "how is it split across AZs?"
+    """
+    rows = list_reservations(client)
+    if not rows:
+        log.info("no active/pending reservations")
+        return
+    for crid, itype, az, state, cnt, tag in rows:
+        log.info("%s  %-12s %-12s %-9s count=%s tag=%s",
+                 crid, itype, az, state, cnt, tag)
+    # Summary: only OUR tagged i4i reservations, counted in CORES.
+    held = held_cores_by_az(client)
+    if held:
+        v16 = VCPU["i4i.16xlarge"]
+        log.info("--- summary (tag=%s) ---", TAG_VAL)
+        for az in sorted(held):
+            log.info("  %-12s %5d vCPU  (%d x i4i.16xlarge)",
+                     az, held[az], held[az] // v16)
+        log.info("  %-12s %5d vCPU  across %d AZ(s)",
+                 "TOTAL", sum(held.values()), len(held))
+
+
 def cancel_all(client, dry_run):
     rows = [r for r in list_reservations(client) if r[5] == TAG_VAL]
     if not rows:
@@ -202,12 +227,7 @@ def run(args):
     client = ec2_client(args.region)
 
     if args.list:
-        rows = list_reservations(client)
-        if not rows:
-            log.info("no active/pending reservations")
-        for crid, itype, az, state, cnt, tag in rows:
-            log.info("%s  %-12s %-12s %-9s count=%s tag=%s",
-                     crid, itype, az, state, cnt, tag)
+        print_list(client)
         return
 
     if args.cancel_all:
@@ -333,7 +353,7 @@ def main():
     p.add_argument("--cancel-all", action="store_true",
                    help="cancel all reservations tagged %s=%s" % (TAG_KEY, TAG_VAL))
     p.add_argument("--list", action="store_true",
-                   help="list current reservations and exit")
+                   help="list current reservations + per-AZ/total core summary, then exit")
     args = p.parse_args()
     try:
         run(args)
