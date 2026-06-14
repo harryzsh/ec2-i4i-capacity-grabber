@@ -101,6 +101,7 @@ def list_reservations(client):
             cr["CapacityReservationId"], cr["InstanceType"],
             cr["AvailabilityZone"], cr["State"],
             cr.get("TotalInstanceCount"), tags.get(TAG_KEY, ""),
+            cr.get("AvailableInstanceCount"),   # 7th: free slots (Total - used)
         ))
     return rows
 
@@ -116,7 +117,7 @@ def held_cores_by_az(client):
     AZ, and only top up the real shortfall — never double-grab, never lopsided.
     """
     held = {}
-    for _crid, itype, az, _state, cnt, tag in list_reservations(client):
+    for _crid, itype, az, _state, cnt, tag, _avail in list_reservations(client):
         if tag != TAG_VAL or itype not in VCPU:
             continue
         held[az] = held.get(az, 0) + VCPU[itype] * (cnt or 1)
@@ -147,6 +148,10 @@ def print_list(client, target_cores=None, per_az_cores=None):
     The summary answers the two questions you actually have during a grab:
     "how many cores do I hold total?" and "how is it split across AZs?"
 
+    Each row also shows USED/free — whether an instance is actually occupying
+    that reservation (Total - Available > 0) — and the summary tallies how many
+    reservations are USED out of the total we hold.
+
     Progress (held/target + FULL/short) is shown automatically: if you don't
     pass --target-cores / --per-az-cores, they're read from the last grab in
     grabs.jsonl — so plain `--list` already shows how close you are.
@@ -158,9 +163,20 @@ def print_list(client, target_cores=None, per_az_cores=None):
     if not rows:
         log.info("no active/pending reservations")
         return
-    for crid, itype, az, state, cnt, tag in rows:
-        log.info("%s  %-12s %-12s %-9s count=%s tag=%s",
-                 crid, itype, az, state, cnt, tag)
+    used_n = 0   # reservations with an instance actually IN them (used > 0)
+    ours_n = 0   # our tagged reservations (the denominator)
+    for crid, itype, az, state, cnt, tag, avail in rows:
+        # USED = is an instance occupying this reservation? (Total - Available)
+        total = cnt or 0
+        free = avail if avail is not None else total
+        used = total - free
+        used_str = "USED" if used > 0 else "free"
+        log.info("%s  %-12s %-12s %-9s count=%s %-4s tag=%s",
+                 crid, itype, az, state, cnt, used_str, tag)
+        if tag == TAG_VAL:
+            ours_n += 1
+            if used > 0:
+                used_n += 1
     # Summary: only OUR tagged i4i reservations, counted in CORES.
     held = held_cores_by_az(client)
     if held:
@@ -183,6 +199,9 @@ def print_list(client, target_cores=None, per_az_cores=None):
         else:
             log.info("  %-12s %5d vCPU  across %d AZ(s)",
                      "TOTAL", total, len(held))
+        # How many reservations actually have an instance in them.
+        log.info("  %-12s %d / %d reservations USED (have an instance running)",
+                 "USED", used_n, ours_n)
 
 
 def cancel_all(client, dry_run):
@@ -190,7 +209,7 @@ def cancel_all(client, dry_run):
     if not rows:
         log.info("no tagged reservations to cancel")
         return
-    for crid, itype, az, state, cnt, _ in rows:
+    for crid, itype, az, state, cnt, _tag, _avail in rows:
         log.info("cancel %s (%s @ %s, %s)", crid, itype, az, state)
         if dry_run:
             log.info("  [dry-run] would cancel")
