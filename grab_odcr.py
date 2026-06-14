@@ -11,6 +11,13 @@ WATCH MODE (--watch): loop forever, re-sweeping every --interval seconds.
 Capacity is intermittent, so 24x7 watching is how you actually catch it.
 Every real reservation is logged and appended to logs/grabs.jsonl.
 
+RESUME / IDEMPOTENCY: the per-AZ and total stop-gates read what we ACTUALLY
+hold from AWS each round (held_cores_by_az), counting CORES not reservation
+objects. So a crash/restart/host-reboot picks up exactly where it left off:
+each AZ is judged against its own real held cores, and the sweep only tops up
+the true shortfall per AZ. No in-memory counter to lose, no double-grab, no
+lopsided distribution after a restart. Safe under systemd Restart=always.
+
 Why ODCR over plain On-Demand: a reservation HOLDS the slot even when no
 instance occupies it (and across stop/terminate/ASG-rollover). Trade-off:
 an ACTIVE reservation bills at the On-Demand rate whether filled or not.
@@ -89,6 +96,24 @@ def list_reservations(client):
     return rows
 
 
+def held_cores_by_az(client):
+    """Sum vCPU per AZ across THIS script's tagged reservations, read LIVE
+    from AWS. Counts CORES (TotalInstanceCount x per-instance vCPU), NOT the
+    number of reservation objects — one reservation can hold many instances,
+    so counting objects would be meaningless.
+
+    This is the stop-gate's source of truth. Re-reading it every round is what
+    makes restarts safe: after a crash we see exactly what we already hold, per
+    AZ, and only top up the real shortfall — never double-grab, never lopsided.
+    """
+    held = {}
+    for _crid, itype, az, _state, cnt, tag in list_reservations(client):
+        if tag != TAG_VAL or itype not in VCPU:
+            continue
+        held[az] = held.get(az, 0) + VCPU[itype] * (cnt or 1)
+    return held
+
+
 def cancel_all(client, dry_run):
     rows = [r for r in list_reservations(client) if r[5] == TAG_VAL]
     if not rows:
@@ -106,55 +131,62 @@ def cancel_all(client, dry_run):
             log.error("  cancel failed: %s", e.response.get("Error"))
 
 
-def _on_grab(args, crid, itype, az, state):
-    """Bookkeeping for one secured reservation: count, log, ledger, push."""
-    state["reserved"] += VCPU[itype]
-    state["per_az"][az] = state["per_az"].get(az, 0) + VCPU[itype]
-    state["made"].append((crid, itype, az))
+def _on_grab(args, crid, itype, az, held, made):
+    """Bookkeeping for one secured reservation: bump held cores, log, ledger.
+
+    held is the per-AZ core gate (seeded from AWS truth each round); we bump it
+    locally so the gate stays accurate WITHIN a sweep, between AWS re-reads.
+    """
+    held[az] = held.get(az, 0) + VCPU[itype]
+    made.append((crid, itype, az))
+    total = sum(held.values())
     if args.per_az_cores:
         log.info("RESERVED %s %s @ %s (+%d vCPU | %s: %d/%d | total %d/%d)",
-                 crid, itype, az, VCPU[itype], az,
-                 state["per_az"][az], args.per_az_cores,
-                 state["reserved"], args.target_cores)
+                 crid, itype, az, VCPU[itype], az, held[az],
+                 args.per_az_cores, total, args.target_cores)
     else:
         log.info("RESERVED %s %s @ %s (+%d vCPU, total %d/%d)",
-                 crid, itype, az, VCPU[itype], state["reserved"], args.target_cores)
-    record_grab("odcr", itype, az, VCPU[itype], state["reserved"],
+                 crid, itype, az, VCPU[itype], total, args.target_cores)
+    record_grab("odcr", itype, az, VCPU[itype], total,
                 args.target_cores, args.region, not args.live)
 
 
-def _az_full(args, state, az):
-    """True if this AZ has hit its per-AZ cap (balanced mode only)."""
+def _az_full(args, held, az):
+    """True if this AZ has hit its per-AZ core cap (balanced mode only).
+
+    Judged against held cores READ FROM AWS this round — so a restart correctly
+    skips an AZ that is already full and keeps topping up the ones that aren't.
+    """
     if args.per_az_cores is None:
         return False
-    return state["per_az"].get(az, 0) >= args.per_az_cores
+    return held.get(az, 0) >= args.per_az_cores
 
 
-def sweep_once(client, args, azs, offered, state):
-    """One full AZ x type pass. Mutates state in place."""
+def sweep_once(client, args, azs, offered, held, made):
+    """One full AZ x type pass. Mutates held/made in place."""
     priority = args.types or DEFAULT_PRIORITY
     throttle_attempt = 0
     for itype in priority:
-        if state["reserved"] >= args.target_cores:
+        if sum(held.values()) >= args.target_cores:
             return
         for az in azs:
-            if state["reserved"] >= args.target_cores:
+            if sum(held.values()) >= args.target_cores:
                 return
-            if _az_full(args, state, az):
-                continue  # balanced mode: this AZ hit its per-AZ cap
+            if _az_full(args, held, az):
+                continue  # balanced mode: this AZ already at its per-AZ cap
             if (itype, az) not in offered:
                 continue
             try:
                 resp = reserve_one(client, itype, az, not args.live, args.end_hours)
                 crid = resp["CapacityReservation"]["CapacityReservationId"]
-                _on_grab(args, crid, itype, az, state)
+                _on_grab(args, crid, itype, az, held, made)
                 throttle_attempt = 0
             except ClientError as e:
                 kind = classify(e)
                 if kind == "dryrun_ok":
                     log.info("[dry-run] would reserve %s @ %s (+%d vCPU)",
                              itype, az, VCPU[itype])
-                    _on_grab(args, "(dry-run)", itype, az, state)
+                    _on_grab(args, "(dry-run)", itype, az, held, made)
                 elif kind == "capacity":
                     log.info("no capacity: %s @ %s — next", itype, az)
                 elif kind == "throttle":
@@ -220,33 +252,45 @@ def run(args):
                         "using --target-cores as the hard overall stop",
                         args.target_cores, args.per_az_cores, len(azs), auto_total)
 
-    state = {"reserved": 0, "made": [], "per_az": {}}
+    made = []  # reservations created in THIS process (for end-of-run listing)
+
+    # held = per-AZ cores we ACTUALLY hold, the stop-gate's source of truth.
+    # LIVE: seed from AWS so a restart resumes exactly where we left off.
+    # dry-run: start empty and simulate locally so the plan preview is clean.
+    held = held_cores_by_az(client) if args.live else {}
+    if args.live and held:
+        log.info("resumed from AWS: %d vCPU already held across AZs %s",
+                 sum(held.values()), held)
 
     if args.watch:
         log.info("WATCH mode: re-sweeping every %ds until %d vCPU reserved "
                  "(Ctrl-C to stop)", args.interval, args.target_cores)
         rounds = 0
-        while state["reserved"] < args.target_cores:
+        while sum(held.values()) < args.target_cores:
             rounds += 1
-            log.info("--- watch round %d (have %d/%d vCPU) ---",
-                     rounds, state["reserved"], args.target_cores)
-            sweep_once(client, args, azs, offered, state)
-            if state["reserved"] >= args.target_cores:
+            # Re-read AWS truth each round (live): this is what makes the watch
+            # loop self-correcting and restart-safe — per-AZ caps are always
+            # judged against what we really hold right now.
+            if args.live:
+                held = held_cores_by_az(client)
+            log.info("--- watch round %d (have %d/%d vCPU | per-AZ %s) ---",
+                     rounds, sum(held.values()), args.target_cores, held)
+            sweep_once(client, args, azs, offered, held, made)
+            if sum(held.values()) >= args.target_cores:
                 break
             time.sleep(args.interval)
         log.info("WATCH target reached after %d round(s)", rounds)
     else:
-        sweep_once(client, args, azs, offered, state)
+        sweep_once(client, args, azs, offered, held, made)
 
-    log.info("=== DONE: reserved %d/%d vCPU across %d reservation(s) ===",
-             state["reserved"], args.target_cores, len(state["made"]))
+    log.info("=== DONE: holding %d/%d vCPU (this run created %d reservation(s)) ===",
+             sum(held.values()), args.target_cores, len(made))
     if args.per_az_cores is not None:
         for az in azs:
-            got = state["per_az"].get(az, 0)
+            got = held.get(az, 0)
             flag = "FULL" if got >= args.per_az_cores else "short"
-            log.info("  per-AZ %s: %d/%d vCPU (%d instances) [%s]",
-                     az, got, args.per_az_cores, got // 64, flag)
-    for crid, t, a in state["made"]:
+            log.info("  per-AZ %s: %d/%d vCPU [%s]", az, got, args.per_az_cores, flag)
+    for crid, t, a in made:
         log.info("  %s %s @ %s", crid, t, a)
     if not args.live:
         log.info("(dry-run — nothing was actually reserved, no billing)")
@@ -260,15 +304,17 @@ def main():
     p.add_argument("--region", default=DEFAULT_REGION,
                    help="AWS region to target (default %s)" % DEFAULT_REGION)
     p.add_argument("--target-cores", type=int, default=8,
-                   help="stop once this many vCPU are reserved (default 8). "
+                   help="stop once this many vCPU are held (default 8). "
                         "If --per-az-cores is set and this is left at default, "
                         "the total is auto-computed as per-az-cores x number-of-AZs.")
     p.add_argument("--per-az-cores", type=int, default=None,
-                   help="BALANCED mode: cap EACH AZ at this many vCPU. The sweep "
-                        "skips any AZ that hits its cap and keeps hunting the rest, "
-                        "so reservations stay even across --azs (matches ASG's 50/50 "
-                        "balancing). e.g. --azs us-east-1b us-east-1d --per-az-cores 3840 "
-                        "caps each AZ at 3840 vCPU (=60x i4i.16xlarge), 7680 total.")
+                   help="BALANCED mode: cap EACH AZ at this many vCPU. The cap is "
+                        "checked against cores actually held in that AZ (read from "
+                        "AWS each round), so the sweep skips any AZ already at its "
+                        "cap and keeps hunting the rest — reservations stay even "
+                        "across --azs (matches ASG's 50/50 balancing) AND a restart "
+                        "resumes per-AZ correctly. e.g. --azs us-east-1b us-east-1d "
+                        "--per-az-cores 5000 caps each AZ at 5000 vCPU, 10000 total.")
     p.add_argument("--types", nargs="*",
                    help="instance-type list; default is ONLY i4i.16xlarge. "
                         "Pass extras to allow fallback, e.g. "
