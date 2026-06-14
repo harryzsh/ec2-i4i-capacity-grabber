@@ -10,7 +10,7 @@ pure-Python core that makes a crash/restart safe —
   * sweep_once(): ONE grab per AZ per pass; the --watch loop repeats sweeps to
     fill up. After a restart, full AZs are skipped and only the short ones get
     topped up — never double-grab a full AZ, never go lopsided.
-  * print_list(): --list prints a per-AZ + total CORE summary.
+  * print_list(): --list prints a per-AZ + total CORE summary (optional target).
   * reserve_one() / list_reservations() / cancel_all(): the 3 ODCR API wrappers.
 
 Run:  python3 -m unittest test_grab_odcr -v
@@ -166,6 +166,30 @@ class PrintListSummary(unittest.TestCase):
         with self.assertLogs("i4i-grab", level="INFO") as cm:
             print_list(client)
         self.assertIn("no active/pending reservations", "\n".join(cm.output))
+
+    def test_summary_shows_target_and_flags_when_given(self):
+        # held: 1b=192(short of 320), 1d=384(>=320 FULL); total 576 of 640 short
+        client = FakeEC2([
+            _reservation("i4i.16xlarge", "us-east-1b", 3),   # 192
+            _reservation("i4i.16xlarge", "us-east-1d", 6),   # 384
+        ])
+        with self.assertLogs("i4i-grab", level="INFO") as cm:
+            print_list(client, target_cores=640, per_az_cores=320)
+        out = "\n".join(cm.output)
+        self.assertIn("192 / 320 vCPU", out)   # 1b progress shown
+        self.assertIn("[short]", out)          # 1b under cap
+        self.assertIn("384 / 320 vCPU", out)   # 1d progress
+        self.assertIn("[FULL]", out)           # 1d at/over cap
+        self.assertIn("576 / 640 vCPU", out)   # total progress
+
+    def test_summary_no_target_keeps_plain_format(self):
+        client = FakeEC2([_reservation("i4i.16xlarge", "us-east-1b", 1)])
+        with self.assertLogs("i4i-grab", level="INFO") as cm:
+            print_list(client)                 # no targets
+        out = "\n".join(cm.output)
+        self.assertNotIn("/", out.split("summary")[-1])  # no "held / target"
+        self.assertNotIn("[FULL]", out)
+        self.assertNotIn("[short]", out)
 
 
 class AzFull(unittest.TestCase):
