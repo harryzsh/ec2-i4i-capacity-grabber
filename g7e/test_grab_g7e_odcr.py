@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""Unit tests for grab_g7e_odcr.py — the count-based core.
+
+These tests mock boto3 entirely (no AWS calls, no cost, runs in CI). They pin
+the behavior that makes a crash/restart safe, COUNT-based (instances, not vCPU):
+
+  * held_count_by_az(): count INSTANCES (sum TotalInstanceCount), not objects;
+    only_azs= restricts the count to in-scope AZs.
+  * _az_full(): per-AZ cap judged against instances actually held.
+  * sweep_once(): ONE grab per AZ per pass; the --watch loop repeats sweeps to
+    fill up. After a restart, full AZs are skipped and only the short ones get
+    topped up — never double-grab a full AZ, never go lopsided.
+  * print_list(): --list prints a per-AZ + total INSTANCE summary (optional
+    target, auto-read from the ledger) + per-reservation USED/free + tally.
+  * reserve_one() / list_reservations() / cancel_all(): the 3 ODCR wrappers.
+
+Run:  python3 -m unittest test_grab_g7e_odcr -v
+"""
+import datetime
+import logging
+import os
+import tempfile
+import unittest
+from argparse import Namespace
+from unittest import mock
+
+from botocore.exceptions import ClientError
+
+import grab_g7e_odcr
+from grab_g7e_odcr import (
+    held_count_by_az, _az_full, sweep_once, print_list,
+    reserve_one, list_reservations, cancel_all, DEFAULT_TARGET,
+)
+from common import INSTANCE_TYPE, TAG_KEY, TAG_VAL
+
+# Quiet the script's INFO chatter during tests; we assert on state, not logs.
+logging.getLogger("g7e-grab").setLevel(logging.CRITICAL)
+
+
+def _cap_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "x"}},
+                       "CreateCapacityReservation")
+
+
+class FakeEC2:
+    """Minimal stand-in for a boto3 EC2 client.
+
+    create_capacity_reservation records (type, az) and returns a fake id,
+    UNLESS that AZ is in `no_capacity` (raises InsufficientInstanceCapacity).
+    DryRun=True always raises DryRunOperation (mirrors real EC2).
+    """
+    def __init__(self, reservations=None, no_capacity=()):
+        self._reservations = reservations or []
+        self._no_capacity = set(no_capacity)
+        self.created = []          # list of (itype, az)
+        self.create_kwargs = []    # full kwargs of each create call
+        self.cancelled = []        # crids passed to cancel
+        self._n = 0
+
+    def describe_capacity_reservations(self, **kwargs):
+        return {"CapacityReservations": self._reservations}
+
+    def create_capacity_reservation(self, **kwargs):
+        self.create_kwargs.append(kwargs)
+        if kwargs.get("DryRun"):
+            raise _cap_error("DryRunOperation")
+        az = kwargs["AvailabilityZone"]
+        if az in self._no_capacity:
+            raise _cap_error("InsufficientInstanceCapacity")
+        self._n += 1
+        self.created.append((kwargs["InstanceType"], az))
+        return {"CapacityReservation": {"CapacityReservationId": "cr-%04d" % self._n}}
+
+    def cancel_capacity_reservation(self, CapacityReservationId=None):
+        self.cancelled.append(CapacityReservationId)
+        return {}
+
+
+def _reservation(az, count, itype=INSTANCE_TYPE, tag=TAG_VAL,
+                 state="active", available=None):
+    # available defaults to count (all free / unused). Pass available<count to
+    # simulate a reservation that has instances in it (USED).
+    r = {
+        "CapacityReservationId": "cr-existing",
+        "InstanceType": itype,
+        "AvailabilityZone": az,
+        "State": state,
+        "TotalInstanceCount": count,
+        "AvailableInstanceCount": count if available is None else available,
+    }
+    if tag is not None:
+        r["Tags"] = [{"Key": TAG_KEY, "Value": tag}]
+    return r
+
+
+def _args(**over):
+    base = dict(region="us-east-1", target_count=4, per_az_count=2,
+                live=True, end_hours=None, azs=None)
+    base.update(over)
+    return Namespace(**base)
+
+
+def _drain(client, args, azs, offered, held, max_rounds=10000):
+    """Drive sweep_once repeatedly the way the --watch loop does, until the
+    target is reached or a full pass makes no progress (capacity exhausted).
+    `held` accumulates in memory across rounds (mirrors run() re-reading it)."""
+    made = []
+    for _ in range(max_rounds):
+        if sum(held.values()) >= args.target_count:
+            break
+        before = dict(held)
+        sweep_once(client, args, azs, offered, held, made)
+        if held == before:
+            break  # no progress this round → capacity exhausted
+    return made
+
+
+class HeldCountByAz(unittest.TestCase):
+    def test_counts_instances_not_reservation_objects(self):
+        # ONE reservation holding 3 instances = 3, NOT 1.
+        client = FakeEC2([_reservation("us-east-1b", 3)])
+        self.assertEqual(held_count_by_az(client), {"us-east-1b": 3})
+
+    def test_sums_multiple_reservations_per_az(self):
+        client = FakeEC2([
+            _reservation("us-east-1b", 2),
+            _reservation("us-east-1b", 1),
+            _reservation("us-east-1d", 3),
+        ])
+        self.assertEqual(held_count_by_az(client),
+                         {"us-east-1b": 3, "us-east-1d": 3})
+
+    def test_ignores_untagged_reservations(self):
+        client = FakeEC2([
+            _reservation("us-east-1b", 3, tag=None),
+            _reservation("us-east-1b", 1),   # ours: 1
+        ])
+        self.assertEqual(held_count_by_az(client), {"us-east-1b": 1})
+
+    def test_ignores_other_tag_values(self):
+        client = FakeEC2([_reservation("us-east-1b", 3, tag="something-else")])
+        self.assertEqual(held_count_by_az(client), {})
+
+    def test_skips_other_instance_type(self):
+        client = FakeEC2([_reservation("us-east-1b", 2, itype="g6e.48xlarge")])
+        self.assertEqual(held_count_by_az(client), {})
+
+    def test_only_azs_filters_out_of_scope_stock(self):
+        # The --azs scope bug: targeting only 1d must NOT count 1b's stock,
+        # else 1b inflates the total gate and stops the run before 1d fills.
+        client = FakeEC2([
+            _reservation("us-east-1b", 4),   # out of scope
+            _reservation("us-east-1d", 3),   # in scope
+        ])
+        self.assertEqual(held_count_by_az(client),
+                         {"us-east-1b": 4, "us-east-1d": 3})
+        only = held_count_by_az(client, only_azs={"us-east-1d"})
+        self.assertEqual(only, {"us-east-1d": 3})
+        self.assertEqual(sum(only.values()), 3)   # gate sees 3, not 7
+
+
+class PrintListSummary(unittest.TestCase):
+    """--list must print a per-AZ + total INSTANCE summary (not just rows)."""
+
+    def test_summary_logs_per_az_and_total_instances(self):
+        client = FakeEC2([
+            _reservation("us-east-1b", 3),
+            _reservation("us-east-1d", 2),
+            _reservation("us-east-1d", 1),                 # 1d=3
+            _reservation("us-east-1c", 5, tag=None),       # not ours
+        ])
+        with self.assertLogs("g7e-grab", level="INFO") as cm:
+            print_list(client)
+        out = "\n".join(cm.output)
+        self.assertIn("us-east-1b", out)
+        self.assertIn("TOTAL", out)
+        self.assertIn("6 instances", out)              # 3+3, untagged excluded
+        self.assertIn("across 2 AZ(s)", out)           # 1c (untagged) not counted
+
+    def test_empty_says_none(self):
+        client = FakeEC2([])
+        with self.assertLogs("g7e-grab", level="INFO") as cm:
+            print_list(client)
+        self.assertIn("no active/pending reservations", "\n".join(cm.output))
+
+    def test_summary_shows_target_and_flags_when_given(self):
+        # held: 1b=1 (short of 2), 1d=3 (>=2 FULL); total 4 of 4 FULL
+        client = FakeEC2([
+            _reservation("us-east-1b", 1),
+            _reservation("us-east-1d", 3),
+        ])
+        with self.assertLogs("g7e-grab", level="INFO") as cm:
+            print_list(client, target_count=4, per_az_count=2)
+        out = "\n".join(cm.output)
+        self.assertIn("1 / 2 %s" % INSTANCE_TYPE, out)   # 1b progress shown
+        self.assertIn("[short]", out)                    # 1b under cap
+        self.assertIn("3 / 2 %s" % INSTANCE_TYPE, out)   # 1d progress
+        self.assertIn("[FULL]", out)                     # 1d at/over cap
+        self.assertIn("4 / 4 instances", out)            # total progress
+
+    def test_summary_no_target_and_no_ledger_keeps_plain_format(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(grab_g7e_odcr, "GRAB_LEDGER",
+                                   os.path.join(d, "nope.jsonl")):
+                client = FakeEC2([_reservation("us-east-1b", 1)])
+                with self.assertLogs("g7e-grab", level="INFO") as cm:
+                    print_list(client)                 # no targets, no ledger
+        out = "\n".join(cm.output)
+        self.assertNotIn("/ 1 instances", out)
+        self.assertNotIn("[FULL]", out)
+        self.assertNotIn("[short]", out)
+
+    def test_used_column_and_used_total_summary(self):
+        client = FakeEC2([
+            _reservation("us-east-1b", 1, available=0),  # USED
+            _reservation("us-east-1b", 1, available=0),  # USED
+            _reservation("us-east-1d", 1, available=1),  # free
+            _reservation("us-east-1c", 1, available=0, tag="x"),  # not ours
+        ])
+        with self.assertLogs("g7e-grab", level="INFO") as cm:
+            print_list(client)
+        out = "\n".join(cm.output)
+        self.assertIn("USED", out)
+        self.assertIn("free", out)
+        self.assertIn("2 / 3 reservations USED", out)
+
+    def test_list_auto_reads_target_from_ledger(self):
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "grabs.jsonl")
+            with open(ledger, "w") as f:
+                f.write('{"target_count":4,"per_az_count":2}\n')
+            with mock.patch.object(grab_g7e_odcr, "GRAB_LEDGER", ledger):
+                client = FakeEC2([
+                    _reservation("us-east-1b", 1),
+                    _reservation("us-east-1d", 1),
+                ])
+                with self.assertLogs("g7e-grab", level="INFO") as cm:
+                    print_list(client)                 # NO args passed
+        out = "\n".join(cm.output)
+        self.assertIn("1 / 2 %s" % INSTANCE_TYPE, out)   # per-AZ target auto-read
+        self.assertIn("2 / 4 instances", out)            # total target auto-read
+
+
+class AzFull(unittest.TestCase):
+    def test_full_at_cap(self):
+        self.assertTrue(_az_full(_args(per_az_count=2),
+                                 {"us-east-1b": 2}, "us-east-1b"))
+
+    def test_not_full_below_cap(self):
+        self.assertFalse(_az_full(_args(per_az_count=2),
+                                  {"us-east-1b": 1}, "us-east-1b"))
+
+    def test_unset_per_az_never_full(self):
+        self.assertFalse(_az_full(_args(per_az_count=None),
+                                  {"us-east-1b": 999}, "us-east-1b"))
+
+
+class SweepGranularity(unittest.TestCase):
+    """Pin the real contract: one sweep grabs at most ONE per AZ."""
+    def setUp(self):
+        self._orig = grab_g7e_odcr.record_grab
+        grab_g7e_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_g7e_odcr.record_grab = self._orig
+
+    def test_single_sweep_grabs_one_per_az(self):
+        held = {}
+        args = _args(per_az_count=5, target_count=10)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2()
+        sweep_once(client, args, azs, offered, held, [])
+        self.assertEqual(sorted(client.created),
+                         [(INSTANCE_TYPE, "us-east-1b"),
+                          (INSTANCE_TYPE, "us-east-1d")])
+        self.assertEqual(held, {"us-east-1b": 1, "us-east-1d": 1})
+
+
+class ResumeBehavior(unittest.TestCase):
+    """A restart must resume per-AZ correctly. Driven through _drain (the watch
+    loop) since one sweep only grabs 1/AZ."""
+
+    def setUp(self):
+        self._orig = grab_g7e_odcr.record_grab
+        grab_g7e_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_g7e_odcr.record_grab = self._orig
+
+    def test_restart_skips_full_az_and_tops_up_short_one(self):
+        cap = 5
+        held = {"us-east-1b": cap, "us-east-1d": 2}   # 1b full, 1d=2
+        args = _args(per_az_count=cap, target_count=2 * cap)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2()
+
+        _drain(client, args, azs, offered, held)
+
+        # 1b was already at cap -> ZERO new reservations there.
+        self.assertEqual([az for _t, az in client.created if az == "us-east-1b"], [])
+        # 1d topped from 2 to 5 -> exactly 3 new.
+        self.assertEqual(
+            len([az for _t, az in client.created if az == "us-east-1d"]), 3)
+        self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
+
+    def test_fresh_start_fills_both_azs_evenly(self):
+        cap = 3
+        held = {}
+        args = _args(per_az_count=cap, target_count=2 * cap)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2()
+        _drain(client, args, azs, offered, held)
+        self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
+        self.assertEqual(len(client.created), 6)        # 3 per AZ
+
+    def test_already_at_target_does_nothing(self):
+        cap = 5
+        held = {"us-east-1b": cap, "us-east-1d": cap}
+        args = _args(per_az_count=cap, target_count=2 * cap)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2()
+        _drain(client, args, azs, offered, held)
+        self.assertEqual(client.created, [])            # not a single new grab
+
+    def test_no_capacity_in_one_az_does_not_crash_or_overshoot(self):
+        cap = 2
+        held = {}
+        args = _args(per_az_count=cap, target_count=2 * cap)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2(no_capacity={"us-east-1b"})
+        _drain(client, args, azs, offered, held)
+        self.assertNotIn("us-east-1b", held)            # never grabbed in 1b
+        self.assertEqual(held["us-east-1d"], cap)       # 1d filled to cap
+
+    def test_per_az_cap_is_hard_per_az_even_if_other_az_dry(self):
+        # 1b dry, target=2*cap. Must NOT overflow 1d past its per-AZ cap to
+        # make up the global target. per-AZ cap wins; we stay short overall.
+        cap = 2
+        held = {}
+        args = _args(per_az_count=cap, target_count=2 * cap)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2(no_capacity={"us-east-1b"})
+        _drain(client, args, azs, offered, held)
+        self.assertEqual(held["us-east-1d"], cap)       # capped, not 2*cap
+        self.assertLess(sum(held.values()), args.target_count)  # stays short
+
+    def test_az_not_offered_is_skipped(self):
+        # g7e.48xlarge not offered in 1a -> never attempt there.
+        held = {}
+        args = _args(per_az_count=2, target_count=4)
+        azs = ["us-east-1a", "us-east-1d"]
+        offered = {"us-east-1d"}                         # 1a NOT offered
+        client = FakeEC2()
+        _drain(client, args, azs, offered, held)
+        self.assertNotIn("us-east-1a", held)
+        self.assertEqual(held["us-east-1d"], 2)
+
+    def test_target_count_is_exact_no_overshoot(self):
+        # count-based gate is exact (unlike the core-based one): each grab is +1,
+        # gate checks before each grab, so we stop precisely at target.
+        held = {}
+        args = _args(per_az_count=10, target_count=3)
+        azs = ["us-east-1b"]
+        offered = {"us-east-1b"}
+        client = FakeEC2()
+        _drain(client, args, azs, offered, held)
+        self.assertEqual(held["us-east-1b"], 3)
+        self.assertEqual(len(client.created), 3)
+
+
+class DryRunPlan(unittest.TestCase):
+    def setUp(self):
+        self._orig = grab_g7e_odcr.record_grab
+        grab_g7e_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_g7e_odcr.record_grab = self._orig
+
+    def test_dry_run_simulates_plan_without_real_reservations(self):
+        cap = 2
+        held = {}
+        args = _args(per_az_count=cap, target_count=2 * cap, live=False)
+        azs = ["us-east-1b", "us-east-1d"]
+        offered = {"us-east-1b", "us-east-1d"}
+        client = FakeEC2()
+        _drain(client, args, azs, offered, held)
+        # plan respects caps in-memory...
+        self.assertEqual(held, {"us-east-1b": cap, "us-east-1d": cap})
+        # ...but NOT one real reservation was created.
+        self.assertEqual(client.created, [])
+
+
+class ReserveOne(unittest.TestCase):
+    """The single CreateCapacityReservation call — pin the exact params that
+    make an OPEN, Linux/UNIX, default-tenancy, count=1 g7e.48xlarge reservation,
+    plus dry-run and end-hours behavior."""
+
+    def test_open_linux_default_count1_tagged(self):
+        client = FakeEC2()
+        reserve_one(client, "us-east-1b", dry_run=False)
+        kw = client.create_kwargs[-1]
+        self.assertEqual(kw["InstanceType"], INSTANCE_TYPE)
+        self.assertEqual(kw["InstancePlatform"], "Linux/UNIX")
+        self.assertEqual(kw["AvailabilityZone"], "us-east-1b")
+        self.assertEqual(kw["InstanceCount"], 1)
+        self.assertEqual(kw["InstanceMatchCriteria"], "open")
+        self.assertEqual(kw["Tenancy"], "default")
+        self.assertEqual(kw["DryRun"], False)
+        self.assertEqual(kw["EbsOptimized"], True)
+        tags = kw["TagSpecifications"][0]["Tags"]
+        self.assertIn({"Key": TAG_KEY, "Value": TAG_VAL}, tags)
+
+    def test_dry_run_flag_passes_through(self):
+        client = FakeEC2()
+        with self.assertRaises(ClientError):     # FakeEC2 raises DryRunOperation
+            reserve_one(client, "us-east-1b", dry_run=True)
+        self.assertTrue(client.create_kwargs[-1]["DryRun"])
+
+    def test_no_end_hours_is_unlimited(self):
+        client = FakeEC2()
+        reserve_one(client, "us-east-1b", dry_run=False)
+        kw = client.create_kwargs[-1]
+        self.assertEqual(kw["EndDateType"], "unlimited")
+        self.assertNotIn("EndDate", kw)
+
+    def test_end_hours_sets_limited_with_future_enddate(self):
+        client = FakeEC2()
+        reserve_one(client, "us-east-1b", dry_run=False, end_hours=6)
+        kw = client.create_kwargs[-1]
+        self.assertEqual(kw["EndDateType"], "limited")
+        self.assertIn("EndDate", kw)
+        self.assertGreater(kw["EndDate"], datetime.datetime.utcnow())
+
+
+class ListReservations(unittest.TestCase):
+    def test_parses_rows_and_tag(self):
+        client = FakeEC2([
+            _reservation("us-east-1b", 3),
+            _reservation("us-east-1d", 1, tag="other"),
+        ])
+        rows = list_reservations(client)
+        self.assertEqual(len(rows), 2)
+        crid, itype, az, state, cnt, tag, avail = rows[0]
+        self.assertEqual(itype, INSTANCE_TYPE)
+        self.assertEqual(az, "us-east-1b")
+        self.assertEqual(state, "active")
+        self.assertEqual(cnt, 3)
+        self.assertEqual(tag, TAG_VAL)
+        self.assertEqual(avail, 3)                     # available slots (7th field)
+        self.assertEqual(rows[1][5], "other")          # tag passthrough
+
+    def test_untagged_reservation_yields_empty_tag(self):
+        client = FakeEC2([_reservation("us-east-1b", 1, tag=None)])
+        self.assertEqual(list_reservations(client)[0][5], "")
+
+
+class CancelAll(unittest.TestCase):
+    def test_only_cancels_our_tagged_reservations(self):
+        client = FakeEC2([
+            _reservation("us-east-1b", 3),                  # ours
+            _reservation("us-east-1d", 2),                  # ours
+            _reservation("us-east-1c", 9, tag="other"),     # NOT ours
+            _reservation("us-east-1a", 9, tag=None),        # NOT ours
+        ])
+        cancel_all(client, dry_run=False)
+        self.assertEqual(len(client.cancelled), 2)
+
+    def test_dry_run_cancels_nothing(self):
+        client = FakeEC2([_reservation("us-east-1b", 3)])
+        cancel_all(client, dry_run=True)
+        self.assertEqual(client.cancelled, [])
+
+    def test_nothing_tagged_is_noop(self):
+        client = FakeEC2([_reservation("us-east-1b", 3, tag="other")])
+        cancel_all(client, dry_run=False)
+        self.assertEqual(client.cancelled, [])
+
+
+class DefaultTarget(unittest.TestCase):
+    def test_placeholder_default_is_one(self):
+        # the --list / balanced-mode "untouched default" sentinel
+        self.assertEqual(DEFAULT_TARGET, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
