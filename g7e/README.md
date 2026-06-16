@@ -77,6 +77,7 @@ python3 grab_g7e_odcr.py --cancel-all --live             # 释放全部、停止
 | `--end-hours N` | N 小时后预留自动过期（计费保险） |
 | `--cancel-all` | 取消全部本脚本 tag 的预留、停止计费 |
 | `--list` | 只看不动（列每条预留 + per-AZ/总计台数汇总，自动从台账读目标显示进度） |
+| `--check-quota` | 抢前预检：读 G/VT On-Demand vCPU 配额，对照目标台数判断够不够（只读、不抢、不计费）。详见 [`配额.md`](配额.md) |
 
 完整参数 `python3 grab_g7e_odcr.py --help`。
 
@@ -86,13 +87,12 @@ python3 grab_g7e_odcr.py --cancel-all --live             # 释放全部、停止
 
 ## 配额（抢前必读）
 
-g7e 属于 **G 系列**，提的是 **`Running On-Demand G and VT instances`** 配额（`L-DB2E81BA`），单位是 **vCPU**，不是台数。每台 g7e.48xlarge = **192 vCPU**，要抢 N 台就把配额提到 **≥ 192 × N**。
+g7e 属于 **G 系列**，提的是 **`Running On-Demand G and VT instances`** 配额（`L-DB2E81BA`，按 **vCPU** 计，每台 g7e.48xlarge = **192 vCPU**，要 N 台就提到 ≥ 192 × N）。
+
+**完整步骤（Console 提 / CLI 提 / 脚本预检）见 → [`配额.md`](配额.md)。** 抢前先跑一次：
 
 ```bash
-# 查当前 G/VT 配额
-aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA --region us-east-1
-# 申请提到 768 vCPU（≈4 台）
-aws service-quotas request-service-quota-increase --service-code ec2 --quota-code L-DB2E81BA --desired-value 768 --region us-east-1
+python3 grab_g7e_odcr.py --check-quota --azs us-east-1b us-east-1d --per-az-count 2
 ```
 
 > **配额批了 ≠ 立刻抢到**：配额只决定“允许你起多少”，真正能不能起还要看那个 AZ 有没有货——所以才要 `--watch` 死等。
@@ -167,6 +167,8 @@ python3 grab_g7e_odcr.py --cancel-all --live
 ```
 
 > `Resource: "*"` 是因为创建容量预留时资源 ARN 尚不存在；如需更严格可结合条件键（如 `aws:RequestedRegion`、tag 条件）收紧。
+>
+> **可选**：用 `--check-quota` 预检配额还需 `servicequotas:GetServiceQuota`（只读）。只抢容量、不预检的话可以不加这条。
 
 ## 监控：看抢了多少
 
@@ -216,7 +218,7 @@ tail -f logs/grab_g7e_odcr.log          # 直接 / tmux 跑的，看这个（脚
 * **Capacity Blocks 不覆盖 G 系列**：G7e 不能用 Capacity Blocks for ML（那是 P/Trn 训练卡的），所以 ODCR 是这里的正解。
 * **只抢 g7e.48xlarge 一种机型**：无尺寸回落（按需求设计）。
 * **成本**：ODCR 一旦 active 就按 On-Demand 价计费，无论有没有实例占用。用完务必 `--cancel-all --live`。
-* **测试**：`python3 -m unittest test_common test_grab_g7e_odcr`（mock boto3，无 AWS、无成本）。
+* **测试**：`python3 -m unittest test_common test_grab_g7e_odcr test_quota`（mock boto3，无 AWS、无成本）。
 
 ## 文件
 
@@ -224,5 +226,7 @@ tail -f logs/grab_g7e_odcr.log          # 直接 / tmux 跑的，看这个（脚
 |------|------|
 | `grab_g7e_odcr.py` | 抢占脚本（count-based，唯一入口） |
 | `common.py` | 共享工具：AZ 发现、供货检查、退避重试、台数台账、日志 |
-| `test_common.py` / `test_grab_g7e_odcr.py` | 单元测试（mock boto3，无 AWS）：`python3 -m unittest test_common test_grab_g7e_odcr` |
+| `quota.py` | G/VT 配额预检（`--check-quota` 的核心逻辑） |
+| `配额.md` | **抢前必读**：Console / CLI 提配额步骤 + 换算表 |
+| `test_common.py` / `test_grab_g7e_odcr.py` / `test_quota.py` | 单元测试（mock boto3，无 AWS）：`python3 -m unittest test_common test_grab_g7e_odcr test_quota` |
 | `requirements.txt` | 依赖（仅 boto3） |

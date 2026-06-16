@@ -305,19 +305,59 @@ def sweep_once(client, args, azs, offered, held, made):
                 raise
 
 
+def _resolved_target(args):
+    """Best-effort instance target WITHOUT touching AWS, mirroring run()'s rule.
+
+    Used by --check-quota and --list: treat the placeholder default as unset;
+    in balanced mode with explicit --azs, derive total = per_az x #--azs.
+    Returns None when no target can be determined.
+    """
+    tgt = None if args.target_count == DEFAULT_TARGET else args.target_count
+    if args.per_az_count and tgt is None and args.azs:
+        tgt = args.per_az_count * len(args.azs)
+    return tgt
+
+
+def report_quota(args):
+    """--check-quota: print the live G/VT vCPU quota and whether it covers the
+    target. Pure preflight — reads Service Quotas, reserves nothing.
+    """
+    from quota import (
+        service_quotas_client, check_quota, get_g_vt_quota, vcpus_needed,
+        max_instances_for, G_VT_QUOTA_NAME, G_VT_QUOTA_CODE,
+    )
+    sq = service_quotas_client(args.region)
+    current = get_g_vt_quota(sq)
+    log.info("G/VT On-Demand quota (%s, %s) in %s: %g vCPU",
+             G_VT_QUOTA_NAME, G_VT_QUOTA_CODE, args.region, current)
+    log.info("  -> allows up to %d x %s (%d vCPU each)",
+             max_instances_for(current), INSTANCE_TYPE, VCPU_PER)
+    tgt = _resolved_target(args)
+    if tgt:
+        needed = vcpus_needed(tgt)
+        ok = current >= needed
+        log.info("  target %d instance(s) needs %d vCPU -> %s",
+                 tgt, needed, "OK" if ok else "INSUFFICIENT")
+        if not ok:
+            log.warning("quota too low — request an increase first. See 配额.md")
+    else:
+        log.info("  (pass --target-count or --per-az-count + --azs to check a "
+                 "specific target)")
+
+
 def run(args):
+    if args.check_quota:
+        report_quota(args)
+        return
+
     client = ec2_client(args.region)
 
     if args.list:
         # Targets are read automatically from grabs.jsonl inside print_list,
         # so plain --list shows progress. If the caller DID pass them, prefer
-        # those: target_count defaults to DEFAULT_TARGET (placeholder) — treat
-        # that as unset; if only --per-az-count given, derive total = per_az x
-        # number-of --azs.
-        tgt = None if args.target_count == DEFAULT_TARGET else args.target_count
+        # those (same resolution rule as --check-quota).
+        tgt = _resolved_target(args)
         per_az = args.per_az_count
-        if per_az and tgt is None and args.azs:
-            tgt = per_az * len(args.azs)
         if tgt is None and per_az is None:
             print_list(client)                       # auto-read from ledger
         else:
@@ -454,6 +494,9 @@ def main():
     p.add_argument("--list", action="store_true",
                    help="list current reservations + per-AZ/total instance "
                         "summary (auto-reads target from grabs.jsonl), then exit")
+    p.add_argument("--check-quota", action="store_true",
+                   help="check the G/VT On-Demand vCPU quota against the target "
+                        "(reads Service Quotas, reserves nothing), then exit")
     args = p.parse_args()
     try:
         run(args)
