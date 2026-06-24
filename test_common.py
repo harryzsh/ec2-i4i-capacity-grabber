@@ -20,6 +20,7 @@ from common import (
     VCPU, DEFAULT_PRIORITY, DEFAULT_REGION,
     resolve_types, resolve_azs, list_azs, offered_types_by_az,
     classify, backoff_sleep, record_grab, setup_logging, ec2_client,
+    describe_vcpus, ensure_vcpu,
 )
 
 
@@ -264,6 +265,123 @@ class Ec2Client(unittest.TestCase):
         with mock.patch.object(common.boto3, "client") as mk:
             ec2_client()
             mk.assert_called_once_with("ec2", region_name=DEFAULT_REGION)
+
+
+class DescribeVcpus(unittest.TestCase):
+    """describe_vcpus(): ask AWS the vCPU count for arbitrary instance types,
+    so the grabber is not limited to the hand-maintained VCPU table."""
+
+    def test_maps_type_to_default_vcpu_count(self):
+        client = mock.Mock()
+        client.describe_instance_types.return_value = {
+            "InstanceTypes": [
+                {"InstanceType": "r7i.48xlarge",
+                 "VCpuInfo": {"DefaultVCpus": 192}},
+                {"InstanceType": "m7i.large",
+                 "VCpuInfo": {"DefaultVCpus": 2}},
+            ]
+        }
+        self.assertEqual(
+            describe_vcpus(client, ["r7i.48xlarge", "m7i.large"]),
+            {"r7i.48xlarge": 192, "m7i.large": 2},
+        )
+        # must query EXACTLY the requested types (no wasted describe of all)
+        _, kwargs = client.describe_instance_types.call_args
+        self.assertEqual(sorted(kwargs["InstanceTypes"]),
+                         ["m7i.large", "r7i.48xlarge"])
+
+    def test_empty_input_makes_no_api_call(self):
+        client = mock.Mock()
+        self.assertEqual(describe_vcpus(client, []), {})
+        client.describe_instance_types.assert_not_called()
+
+    def test_paginates_with_next_token(self):
+        client = mock.Mock()
+        client.describe_instance_types.side_effect = [
+            {"InstanceTypes": [{"InstanceType": "c7i.large",
+                                "VCpuInfo": {"DefaultVCpus": 2}}],
+             "NextToken": "tok"},
+            {"InstanceTypes": [{"InstanceType": "c7i.2xlarge",
+                                "VCpuInfo": {"DefaultVCpus": 8}}]},
+        ]
+        out = describe_vcpus(client, ["c7i.large", "c7i.2xlarge"])
+        self.assertEqual(out, {"c7i.large": 2, "c7i.2xlarge": 8})
+        self.assertEqual(client.describe_instance_types.call_count, 2)
+        # 2nd call must forward the NextToken from the 1st
+        _, kw2 = client.describe_instance_types.call_args_list[1]
+        self.assertEqual(kw2.get("NextToken"), "tok")
+
+    def test_unresolvable_type_simply_absent(self):
+        # AWS returns nothing for a bogus type -> it's just not in the map.
+        client = mock.Mock()
+        client.describe_instance_types.return_value = {"InstanceTypes": []}
+        self.assertEqual(describe_vcpus(client, ["nope.nope"]), {})
+
+
+class EnsureVcpu(unittest.TestCase):
+    """ensure_vcpu(): enrich the in-memory VCPU table for any requested types
+    that aren't already known, by asking AWS. No-op (no API call) when every
+    requested type is already in the table — this keeps --list and the
+    all-i4i default path from ever touching DescribeInstanceTypes."""
+
+    def setUp(self):
+        # work on a copy so we never mutate the module's real table across tests
+        self._orig = dict(common.VCPU)
+
+    def tearDown(self):
+        common.VCPU.clear()
+        common.VCPU.update(self._orig)
+
+    def test_known_types_make_no_api_call(self):
+        client = mock.Mock()
+        added, unresolved = ensure_vcpu(client, ["i4i.16xlarge", "i4g.large"])
+        self.assertEqual(added, {})
+        self.assertEqual(unresolved, [])
+        client.describe_instance_types.assert_not_called()
+
+    def test_none_or_empty_is_noop(self):
+        client = mock.Mock()
+        self.assertEqual(ensure_vcpu(client, None), ({}, []))
+        self.assertEqual(ensure_vcpu(client, []), ({}, []))
+        client.describe_instance_types.assert_not_called()
+
+    def test_learns_unknown_type_and_inserts_into_table(self):
+        client = mock.Mock()
+        client.describe_instance_types.return_value = {
+            "InstanceTypes": [
+                {"InstanceType": "r7i.48xlarge",
+                 "VCpuInfo": {"DefaultVCpus": 192}},
+            ]
+        }
+        self.assertNotIn("r7i.48xlarge", common.VCPU)
+        added, unresolved = ensure_vcpu(
+            client, ["i4i.16xlarge", "r7i.48xlarge"])
+        self.assertEqual(added, {"r7i.48xlarge": 192})
+        self.assertEqual(unresolved, [])
+        # the learned value is now usable by all the core counting logic
+        self.assertEqual(common.VCPU["r7i.48xlarge"], 192)
+        # only the UNKNOWN type was queried, not the already-known i4i
+        _, kwargs = client.describe_instance_types.call_args
+        self.assertEqual(kwargs["InstanceTypes"], ["r7i.48xlarge"])
+
+    def test_reports_unresolvable_types(self):
+        client = mock.Mock()
+        client.describe_instance_types.return_value = {"InstanceTypes": []}
+        added, unresolved = ensure_vcpu(client, ["totally.bogus"])
+        self.assertEqual(added, {})
+        self.assertEqual(unresolved, ["totally.bogus"])
+        self.assertNotIn("totally.bogus", common.VCPU)
+
+    def test_deduplicates_requested_unknowns(self):
+        client = mock.Mock()
+        client.describe_instance_types.return_value = {
+            "InstanceTypes": [
+                {"InstanceType": "m7i.large", "VCpuInfo": {"DefaultVCpus": 2}},
+            ]
+        }
+        ensure_vcpu(client, ["m7i.large", "m7i.large"])
+        _, kwargs = client.describe_instance_types.call_args
+        self.assertEqual(kwargs["InstanceTypes"], ["m7i.large"])
 
 
 if __name__ == "__main__":

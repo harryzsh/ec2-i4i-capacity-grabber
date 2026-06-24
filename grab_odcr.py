@@ -45,7 +45,7 @@ from botocore.exceptions import ClientError
 from common import (
     DEFAULT_REGION, VCPU, DEFAULT_PRIORITY, GRAB_LEDGER, ec2_client, list_azs,
     offered_types_by_az, backoff_sleep, classify, setup_logging,
-    record_grab, resolve_types, resolve_azs,
+    record_grab, resolve_types, resolve_azs, ensure_vcpu,
 )
 
 TAG_KEY = "purpose"
@@ -170,6 +170,11 @@ def print_list(client, target_cores=None, per_az_cores=None):
     if not rows:
         log.info("no active/pending reservations")
         return
+    # Learn the vCPU of any tagged type we hold but don't have in the static
+    # table (e.g. a custom type grabbed in a prior run), so held_cores_by_az
+    # counts it instead of silently skipping it. No API call if all are known.
+    ensure_vcpu(client, [itype for _c, itype, _a, _s, _n, tag, _av in rows
+                         if tag == TAG_VAL])
     used_n = 0   # reservations with an instance actually IN them (used > 0)
     ours_n = 0   # our tagged reservations (the denominator)
     for crid, itype, az, state, cnt, tag, avail in rows:
@@ -321,12 +326,28 @@ def run(args):
     log.info("region=%s dry_run=%s target_cores=%d end_hours=%s watch=%s",
              args.region, not args.live, args.target_cores, args.end_hours, args.watch)
 
+    # Learn the vCPU count for any requested type that isn't in the static
+    # table (asks AWS once via DescribeInstanceTypes), so we can grab ANY
+    # instance type — not just the i4i/i4g families baked into VCPU. No-op /
+    # no API call when --types is unset (default i4i.16xlarge) or all-known.
+    added, unresolvable = ensure_vcpu(client, args.types)
+    if added:
+        log.info("learned vCPU from AWS for new types: %s", added)
+    if unresolvable:
+        log.warning("AWS could not resolve these instance types (ignored): %s",
+                    unresolvable)
+
     # Resolve & normalize the type priority (auto-sorted large-first) and
-    # write it back so sweep_once() uses the exact same ordered list.
+    # write it back so sweep_once() uses the exact same ordered list. After
+    # ensure_vcpu above, any AWS-known type is in VCPU, so resolve_types only
+    # drops truly bogus names.
     types, dropped = resolve_types(args.types)
     if dropped:
         log.warning("ignoring unknown instance types (not in VCPU table): %s", dropped)
     args.types = types
+    if not types:
+        log.error("no usable instance types after resolution — nothing to do")
+        return
     log.info("instance-type priority (large-first): %s", types)
 
     all_azs = list_azs(client)
@@ -427,8 +448,11 @@ def main():
                         "--per-az-cores 5000 caps each AZ at 5000 vCPU, 10000 total.")
     p.add_argument("--types", nargs="*",
                    help="instance-type list; default is ONLY i4i.16xlarge. "
-                        "Pass extras to allow fallback, e.g. "
-                        "--types i4i.16xlarge i4i.8xlarge (auto-sorted large-first)")
+                        "Pass ANY EC2 instance type(s) — their vCPU count is "
+                        "looked up from AWS automatically (DescribeInstanceTypes) "
+                        "if not already in the built-in table, so you are not "
+                        "limited to i4i/i4g. e.g. --types r7i.48xlarge m7i.24xlarge "
+                        "(auto-sorted large-first; unknown-to-AWS names dropped)")
     p.add_argument("--azs", nargs="*",
                    help="lock to these AZ names, e.g. --azs us-east-1c us-east-1d "
                         "(default: every AZ in the region)")
