@@ -492,5 +492,86 @@ class CancelAll(unittest.TestCase):
         self.assertEqual(client.cancelled, [])
 
 
+class RunFake(FakeEC2):
+    """FakeEC2 plus the describe_* calls run() needs end-to-end, so we can
+    drive run() with an arbitrary (non-i4i) instance type and prove it is
+    learned from AWS and then swept — the whole point of the feature."""
+
+    def __init__(self, azs=("us-east-1b", "us-east-1d"), vcpus=None,
+                 offered=None, **kw):
+        super().__init__(**kw)
+        self._azs = list(azs)
+        self._vcpus = dict(vcpus or {})          # type -> DefaultVCpus
+        # which (type, az) are offered; default: every requested type in every AZ
+        self._offered = offered
+        self.described_types = []                # types passed to DescribeInstanceTypes
+
+    def describe_availability_zones(self, **kwargs):
+        return {"AvailabilityZones": [{"ZoneName": z} for z in self._azs]}
+
+    def describe_instance_types(self, **kwargs):
+        req = kwargs.get("InstanceTypes", [])
+        self.described_types.append(list(req))
+        return {"InstanceTypes": [
+            {"InstanceType": t, "VCpuInfo": {"DefaultVCpus": self._vcpus[t]}}
+            for t in req if t in self._vcpus
+        ]}
+
+    def describe_instance_type_offerings(self, **kwargs):
+        types = kwargs["Filters"][0]["Values"]
+        if self._offered is not None:
+            offs = [{"InstanceType": t, "Location": az}
+                    for (t, az) in self._offered if t in types]
+        else:
+            offs = [{"InstanceType": t, "Location": az}
+                    for t in types for az in self._azs]
+        return {"InstanceTypeOfferings": offs}
+
+
+class RunLearnsCustomType(unittest.TestCase):
+    """run() must accept a machine type that is NOT in the static VCPU table:
+    look its vCPU up from AWS, then sweep/reserve it like any i4i size."""
+
+    def setUp(self):
+        self._orig_vcpu = dict(VCPU)
+        self._orig_rec = grab_odcr.record_grab
+        grab_odcr.record_grab = lambda *a, **k: None
+
+    def tearDown(self):
+        grab_odcr.record_grab = self._orig_rec
+        VCPU.clear()
+        VCPU.update(self._orig_vcpu)
+
+    def test_run_grabs_arbitrary_type_after_learning_vcpu(self):
+        self.assertNotIn("r7i.48xlarge", VCPU)   # truly unknown up front
+        client = RunFake(
+            azs=["us-east-1b", "us-east-1d"],
+            vcpus={"r7i.48xlarge": 192},
+        )
+        args = _args(types=["r7i.48xlarge"], per_az_cores=192,
+                     target_cores=384, live=True, watch=False,
+                     interval=0, list=False, cancel_all=False, azs=None)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        # learned the vCPU from AWS...
+        self.assertEqual(VCPU["r7i.48xlarge"], 192)
+        self.assertIn(["r7i.48xlarge"], client.described_types)
+        # ...and actually reserved it in both AZs (1 per AZ in a non-watch run)
+        self.assertEqual(sorted(client.created),
+                         [("r7i.48xlarge", "us-east-1b"),
+                          ("r7i.48xlarge", "us-east-1d")])
+
+    def test_run_aborts_when_type_unresolvable(self):
+        # AWS knows nothing about the type -> after dropping it there is
+        # nothing to sweep, so we must NOT create any reservation.
+        client = RunFake(azs=["us-east-1b"], vcpus={})  # describe returns []
+        args = _args(types=["totally.bogus"], per_az_cores=None,
+                     target_cores=8, live=True, watch=False,
+                     interval=0, list=False, cancel_all=False, azs=None)
+        with mock.patch.object(grab_odcr, "ec2_client", return_value=client):
+            grab_odcr.run(args)
+        self.assertEqual(client.created, [])
+
+
 if __name__ == "__main__":
     unittest.main()

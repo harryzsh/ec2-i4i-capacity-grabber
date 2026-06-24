@@ -121,6 +121,66 @@ def ec2_client(region=DEFAULT_REGION):
     return boto3.client("ec2", region_name=region)
 
 
+def describe_vcpus(client, types):
+    """Ask AWS the DefaultVCpus for each instance type in `types`.
+
+    Returns {instance_type: vcpu} for the types AWS recognizes. Types AWS does
+    not know are simply absent from the result (the caller decides what to do
+    with the gap). Paginates via NextToken. No API call for an empty list.
+
+    This is what lets the grabber target ANY instance type instead of only the
+    families baked into the static VCPU table.
+    """
+    types = list(types)
+    if not types:
+        return {}
+    out = {}
+    token = None
+    while True:
+        kwargs = {"InstanceTypes": types}
+        if token:
+            kwargs["NextToken"] = token
+        resp = client.describe_instance_types(**kwargs)
+        for it in resp.get("InstanceTypes", []):
+            vcpu = it.get("VCpuInfo", {}).get("DefaultVCpus")
+            if vcpu is not None:
+                out[it["InstanceType"]] = vcpu
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return out
+
+
+def ensure_vcpu(client, types):
+    """Make sure every type in `types` has a vCPU count in the VCPU table.
+
+    For any requested type NOT already known, look it up from AWS (one
+    DescribeInstanceTypes call) and insert it into the in-memory VCPU table so
+    all the downstream core-counting logic (resolve_types, held_cores_by_az,
+    sweep_once) works on it unchanged.
+
+    Returns (added, unresolvable):
+      added        -> {type: vcpu} newly learned and inserted this call
+      unresolvable -> requested types AWS could not resolve (caller warns/drops)
+
+    No-op (NO API call) when types is empty or every requested type is already
+    known — so the all-i4i default path and `--list` never touch the EC2 API.
+    """
+    if not types:
+        return {}, []
+    unknown = []
+    for t in types:
+        if t not in VCPU and t not in unknown:
+            unknown.append(t)
+    if not unknown:
+        return {}, []
+    learned = describe_vcpus(client, unknown)
+    VCPU.update(learned)
+    added = dict(learned)
+    unresolvable = [t for t in unknown if t not in learned]
+    return added, unresolvable
+
+
 def resolve_types(types):
     """Normalize the instance-type priority list.
 
